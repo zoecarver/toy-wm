@@ -1203,11 +1203,16 @@ def preload_weights(state, tt_device):
     dev['mixer_w'] = to_tt(state["time_emb_mixer.weight"].T.contiguous(), tt_device)
     dev['mixer_bias'] = to_tt(expand_bias(state["time_emb_mixer.bias"], TILE), tt_device)
 
+    # Batch all 8 blocks' modulation weights into one mega tensor for single matmul
+    mod_w_list = []
+    for i in range(N_BLOCKS):
+        mod_w_list.append(state[f"blocks.{i}.modulation.1.weight"].T.contiguous())
+    dev['mega_mod_w'] = to_tt(torch.cat(mod_w_list, dim=1), tt_device)  # (320, 15360)
+
     for i in range(N_BLOCKS):
         p = f"blocks.{i}"
 
-        # Modulation weight (bias split into 6 chunks, broadcast to SEQ_PADDED)
-        dev[f'{p}.mod_w'] = to_tt(state[f"{p}.modulation.1.weight"].T.contiguous(), tt_device)
+        # Modulation bias split into 6 chunks, broadcast to SEQ_PADDED
         mod_bias = state[f"{p}.modulation.1.bias"]
         for ci, name in enumerate(['mu1', 'sigma1', 'c1', 'mu2', 'sigma2', 'c2']):
             chunk = mod_bias[ci*D_MODEL:(ci+1)*D_MODEL]
@@ -1301,6 +1306,8 @@ def prealloc_scratch(tt_device):
     # (SEQ_PADDED, 2*D_MID) for fused up+gate, plus (SEQ_PADDED, D_MID) for silu_mul output
     s['d2560'] = zeros_tt((SEQ_PADDED, 2 * D_MID), tt_device)
     s['d1280_a'] = zeros_tt((SEQ_PADDED, D_MID), tt_device)
+    # (TILE, 15360) for batched modulation linear across all 8 blocks
+    s['mega_mod'] = zeros_tt((TILE, N_BLOCKS * 1920), tt_device)
     # (TILE, 1920) for modulation
     s['mod_a'] = zeros_tt((TILE, 1920), tt_device)
     s['mod_b'] = zeros_tt((TILE, 1920), tt_device)
@@ -1363,12 +1370,19 @@ def dit_forward(z_frame, time_pe_tt, cond_bias_action_tt, state, dev, scr, tt_de
         'norm2_mod', 'geglu'
     ]}
 
+    # Batched modulation linear: one matmul for all 8 blocks
+    t0 = tnow()
+    linear_k10(scr['cond_silu'], dev['mega_mod_w'], scr['mega_mod'])
+    timers['mod_linear'] = tnow() - t0
+
     for block_idx in range(N_BLOCKS):
         p = f"blocks.{block_idx}"
 
         t0 = tnow()
-        linear_k10(scr['cond_silu'], dev[f'{p}.mod_w'], scr['mod_a'])
-        mod_broadcast_all(scr['mod_a'],
+        mod_slice = ttnn.slice(scr['mega_mod'],
+                               [0, block_idx * 1920],
+                               [TILE, (block_idx + 1) * 1920])
+        mod_broadcast_all(mod_slice,
             dev[f'{p}.mod_bias_mu1'], dev[f'{p}.mod_bias_sigma1'],
             dev[f'{p}.mod_bias_c1'], dev[f'{p}.mod_bias_mu2'],
             dev[f'{p}.mod_bias_sigma2'], dev[f'{p}.mod_bias_c2'],
@@ -1467,6 +1481,7 @@ def dit_forward(z_frame, time_pe_tt, cond_bias_action_tt, state, dev, scr, tt_de
     total = sum(timers.values()) + sum(block_timers.values())
     print(f"  dit_forward total: {total*1000:.0f}ms")
     print(f"    conditioning: {timers['conditioning']*1000:.1f}ms")
+    print(f"    mod_linear:   {timers['mod_linear']*1000:.1f}ms")
     print(f"    patch:        {timers['patch']*1000:.1f}ms")
     print(f"    final_mod:    {timers['final_mod']*1000:.1f}ms")
     print(f"    unpatch:      {timers['unpatch']*1000:.1f}ms")
