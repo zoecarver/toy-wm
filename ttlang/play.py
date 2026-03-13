@@ -50,10 +50,12 @@ HTML_PAGE = """<!DOCTYPE html>
   <kbd>&uarr;</kbd> Up &nbsp;&nbsp;
   <kbd>&darr;</kbd> Down &nbsp;&nbsp;
   <kbd>Space</kbd> Stay &nbsp;&nbsp;
+  <kbd>1</kbd>-<kbd>8</kbd> Steps &nbsp;&nbsp;
 </div>
 <div class="info">
   <span id="fps">--</span> &nbsp;|&nbsp;
   Frame <span id="frame_num">0</span> &nbsp;|&nbsp;
+  Steps: <span id="steps_info">6</span> &nbsp;|&nbsp;
   Cache: <span id="cache_info">0</span> frames
 </div>
 
@@ -62,12 +64,18 @@ const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const status = document.getElementById('status');
 let currentAction = 1; // 1=stay
+let nSteps = 6;
 let running = false;
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowUp') { currentAction = 2; e.preventDefault(); }
   else if (e.key === 'ArrowDown') { currentAction = 3; e.preventDefault(); }
   else if (e.key === ' ') { currentAction = 1; e.preventDefault(); }
+  else if (e.key >= '1' && e.key <= '8') {
+    nSteps = parseInt(e.key);
+    document.getElementById('steps_info').textContent = nSteps;
+    e.preventDefault();
+  }
   if (!running) { running = true; generateLoop(); }
 });
 
@@ -81,7 +89,7 @@ async function generateLoop() {
       const resp = await fetch('/generate', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: action})
+        body: JSON.stringify({action: action, n_steps: nSteps})
       });
       const data = await resp.json();
       const img = new Image();
@@ -89,7 +97,7 @@ async function generateLoop() {
       img.src = 'data:image/png;base64,' + data.image;
       document.getElementById('frame_num').textContent = data.frame_idx;
       document.getElementById('cache_info').textContent = data.cached_frames;
-      document.getElementById('fps').textContent = data.elapsed.toFixed(1) + 's/frame';
+      document.getElementById('fps').textContent = (1.0 / data.elapsed).toFixed(1) + ' fps';
       status.textContent = 'Playing! Press arrows to steer.';
       status.style.color = '#4f4';
     } catch (err) {
@@ -129,7 +137,7 @@ class GameState:
         self.mean_scale_16_tt = None
         self.kv_cache = None
         self.frame_idx = 0
-        self.n_steps = 8
+        self.n_steps = 6
         self.cfg = 1.0
         self.n_window = 30
         self.lock = threading.Lock()
@@ -152,19 +160,20 @@ class GameState:
         self.scr = prealloc_scratch(self.tt_device)
         print("Model ready!")
 
-    def generate_frame(self, action):
+    def generate_frame(self, action, n_steps=None):
         with self.lock:
+            steps = n_steps if n_steps is not None else self.n_steps
             noise = torch.randn(1, 3, HEIGHT, WIDTH, dtype=torch.bfloat16)
             t0 = time.time()
             frame, new_kv = sample_frame(
-                noise, action, self.n_steps, self.cfg,
+                noise, action, steps, self.cfg,
                 self.state, self.dev, self.scr, self.tt_device,
                 self.scaler_tt, self.mean_scale_tt, self.mean_scale_16_tt,
                 kv_cache=self.kv_cache, frame_idx=self.frame_idx,
             )
             self.kv_cache = extend_kv_cache(self.kv_cache, new_kv, self.n_window)
             elapsed = time.time() - t0
-            cached_frames = self.frame_idx
+            cached_frames = min(self.frame_idx, self.n_window - 1)
             fidx = self.frame_idx
             self.frame_idx += 1
 
@@ -211,7 +220,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             data = json.loads(body)
             action = max(0, min(3, int(data.get('action', 1))))
-            result = game.generate_frame(action)
+            n_steps = max(1, min(8, int(data.get('n_steps', 6))))
+            result = game.generate_frame(action, n_steps=n_steps)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()

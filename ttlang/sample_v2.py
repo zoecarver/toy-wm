@@ -1153,14 +1153,41 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         v_sdpa = ttnn.reshape(v_hm, [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         t_v = tnow() - t1
 
+        # Extract raw K/V to host (pre-norm, pre-RoPE) for cache
         t1 = tnow()
+        qkv_h = ttnn.to_torch(scr['qkv_out'])[:SEQ]
+        k_start = N_HEADS * D_HEAD_PAD
+        k_raw = qkv_h[:, k_start:k_start + N_HEADS * D_HEAD_PAD]
+        k_raw = k_raw.reshape(1, SEQ, N_HEADS, D_HEAD_PAD)[:, :, :, :D_HEAD]
+        v_start = 2 * N_HEADS * D_HEAD_PAD
+        v_raw = qkv_h[:, v_start:v_start + N_HEADS * D_HEAD_PAD]
+        v_raw = v_raw.reshape(1, SEQ, N_HEADS, D_HEAD_PAD)[:, :, :, :D_HEAD]
+        new_kv.append({'k': k_raw, 'v': v_raw})
+
+        # Rebuild full K/V with correct RoPE positions for SDPA
         if kv_cache is not None and kv_cache[block_idx] is not None:
-            k_sdpa = ttnn.concat([kv_cache[block_idx]['k'], k_new_sdpa], dim=2)
-            v_full = ttnn.concat([kv_cache[block_idx]['v'], v_sdpa], dim=2)
+            k_all = torch.cat([kv_cache[block_idx]['k'], k_raw], dim=1)
+            v_all = torch.cat([kv_cache[block_idx]['v'], v_raw], dim=1)
         else:
-            k_sdpa = k_new_sdpa
-            v_full = v_sdpa
-        new_kv.append({'k': ttnn.clone(k_new_sdpa), 'v': ttnn.clone(v_sdpa)})
+            k_all = k_raw
+            v_all = v_raw
+        total_kv = k_all.shape[1]
+        kv_padded = ((total_kv + TILE - 1) // TILE) * TILE
+
+        # Apply RMSNorm + RoPE to all K with correct positions
+        k_normed = rmsnorm_host(k_all, state[f"{p}.selfattn.lnk.w"])
+        sins = state[f"{p}.selfattn.rope.sins"][:, :total_kv, :, :]
+        coss = state[f"{p}.selfattn.rope.coss"][:, :total_kv, :, :]
+        k_roped = apply_rope(k_normed, sins, coss)
+
+        k_sdpa_h = F.pad(F.pad(k_roped.permute(0, 2, 1, 3),
+                                (0, D_HEAD_PAD - D_HEAD)),
+                          (0, 0, 0, kv_padded - total_kv))
+        v_sdpa_h = F.pad(F.pad(v_all.permute(0, 2, 1, 3),
+                                (0, D_HEAD_PAD - D_HEAD)),
+                          (0, 0, 0, kv_padded - total_kv))
+        k_sdpa = to_tt(k_sdpa_h, tt_device)
+        v_full = to_tt(v_sdpa_h, tt_device)
         t_kv_cache = tnow() - t1
 
         t1 = tnow()
@@ -1251,9 +1278,11 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
     ts = 1 - torch.linspace(0, 1, n_steps + 1)
     ts = 3 * ts / (2 * ts + 1)
 
-    # Build RoPE sin/cos tables (constant across denoise steps)
-    # Use real token count (frame_idx * TOKS_PER_FRAME), not padded cache shape
-    kv_offset = frame_idx * TOKS_PER_FRAME
+    # Build RoPE sin/cos tables for Q (constant across denoise steps)
+    # K gets RoPE applied host-side in dit_forward with correct positions
+    kv_offset = 0
+    if kv_cache is not None and kv_cache[0] is not None:
+        kv_offset = kv_cache[0]['k'].shape[1]
     rope_tables = build_rope_tables(state, kv_offset, tt_device)
 
     # Pre-cache per-frame constants on device (avoid to_tt in hot loop)
@@ -1302,7 +1331,7 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
 
 
 def extend_kv_cache(kv_cache, new_kv, n_window):
-    """Extend KV cache with new K/V (device tensors). Concat along seq dim (dim=2)."""
+    """Extend KV cache with raw host K/V. Concat along seq dim (dim=1)."""
     max_cached_frames = n_window - 1
     max_cached_seq = max_cached_frames * TOKS_PER_FRAME
 
@@ -1316,17 +1345,12 @@ def extend_kv_cache(kv_cache, new_kv, n_window):
         cur_k = new_kv[layer_idx]['k']
         cur_v = new_kv[layer_idx]['v']
 
-        full_k = ttnn.concat([old_k, cur_k], dim=2)
-        full_v = ttnn.concat([old_v, cur_v], dim=2)
+        full_k = torch.cat([old_k, cur_k], dim=1)
+        full_v = torch.cat([old_v, cur_v], dim=1)
 
-        # Trim to max window
-        total_seq = full_k.shape[2]
-        if total_seq > max_cached_seq:
-            trim_start = total_seq - max_cached_seq
-            full_k = ttnn.slice(full_k, [0, 0, trim_start, 0],
-                                [1, N_HEADS, total_seq, D_HEAD_PAD])
-            full_v = ttnn.slice(full_v, [0, 0, trim_start, 0],
-                                [1, N_HEADS, total_seq, D_HEAD_PAD])
+        if full_k.shape[1] > max_cached_seq:
+            full_k = full_k[:, -max_cached_seq:]
+            full_v = full_v[:, -max_cached_seq:]
 
         updated.append({'k': full_k, 'v': full_v})
 
