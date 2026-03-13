@@ -668,6 +668,7 @@ def make_fused_norm_rope_kernel(qkv_col_offset):
 fused_q_norm_rope = make_fused_norm_rope_kernel(0)           # Q cols 0-19
 fused_k_norm_rope = make_fused_norm_rope_kernel(N_HEADS)     # K cols 20-39
 
+
 rmsnorm_d320 = make_rmsnorm_kernel(D_MODEL // TILE)
 rmsnorm_d1 = make_rmsnorm_kernel(1)  # for QK-norm over D_HEAD_PAD=32 (1 tile)
 fused_norm_mod_d320 = make_fused_norm_mod_kernel(D_MODEL // TILE)
