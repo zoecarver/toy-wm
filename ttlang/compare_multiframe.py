@@ -31,8 +31,10 @@ scaler_tt = to_tt(torch.ones(TILE, TILE, dtype=torch.bfloat16))
 mean_scale_tt = to_tt(torch.full((TILE, TILE), 1.0/D_MODEL, dtype=torch.bfloat16))
 mean_scale_16_tt = to_tt(torch.full((TILE, TILE), 1.0/D_HEAD, dtype=torch.bfloat16))
 
-import sample as v1
-import sample_v2 as v2
+import sample_v1 as v1
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import ttlang_sample as v2
 
 dev = v2.preload_weights(state, device)
 scr = v2.prealloc_scratch(device)
