@@ -73,22 +73,24 @@ def make_linear_kernel(k_chunk):
                         tx = ttl.copy(blk, out[row, col]); tx.wait()
     return linear_kernel
 
+ELEM_GRAN = 5  # column tiles per block for elementwise kernels
+
 @ttl.kernel(grid="auto")
 def add_kernel(a, b, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = a.shape[0] // TILE
-    col_tiles = a.shape[1] // TILE
-    total_tiles = row_tiles * col_tiles
-    tiles_per_core = -(-total_tiles // grid_cols)
-    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), buffer_factor=2)
-    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+    col_blocks = a.shape[1] // TILE // ELEM_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, ELEM_GRAN), buffer_factor=2)
+    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, ELEM_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
+            if t < total:
                 with a_dfb.wait() as av, b_dfb.wait() as bv, out_dfb.reserve() as o:
                     o.store(av + bv)
     @ttl.datamovement()
@@ -96,40 +98,42 @@ def add_kernel(a, b, out):
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with a_dfb.reserve() as blk:
-                    tx = ttl.copy(a[row, col], blk); tx.wait()
+                    tx = ttl.copy(a[row, sc:sc + ELEM_GRAN], blk); tx.wait()
                 with b_dfb.reserve() as blk:
-                    tx = ttl.copy(b[row, col], blk); tx.wait()
+                    tx = ttl.copy(b[row, sc:sc + ELEM_GRAN], blk); tx.wait()
     @ttl.datamovement()
     def dm_write():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with out_dfb.wait() as blk:
-                    tx = ttl.copy(blk, out[row, col]); tx.wait()
+                    tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
 @ttl.kernel(grid="auto")
 def mul_kernel(a, b, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = a.shape[0] // TILE
-    col_tiles = a.shape[1] // TILE
-    total_tiles = row_tiles * col_tiles
-    tiles_per_core = -(-total_tiles // grid_cols)
-    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), buffer_factor=2)
-    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+    col_blocks = a.shape[1] // TILE // ELEM_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, ELEM_GRAN), buffer_factor=2)
+    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, ELEM_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
+            if t < total:
                 with a_dfb.wait() as av, b_dfb.wait() as bv, out_dfb.reserve() as o:
                     o.store(av * bv)
     @ttl.datamovement()
@@ -137,39 +141,41 @@ def mul_kernel(a, b, out):
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with a_dfb.reserve() as blk:
-                    tx = ttl.copy(a[row, col], blk); tx.wait()
+                    tx = ttl.copy(a[row, sc:sc + ELEM_GRAN], blk); tx.wait()
                 with b_dfb.reserve() as blk:
-                    tx = ttl.copy(b[row, col], blk); tx.wait()
+                    tx = ttl.copy(b[row, sc:sc + ELEM_GRAN], blk); tx.wait()
     @ttl.datamovement()
     def dm_write():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with out_dfb.wait() as blk:
-                    tx = ttl.copy(blk, out[row, col]); tx.wait()
+                    tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
 @ttl.kernel(grid="auto")
 def silu_kernel(x, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = x.shape[0] // TILE
-    col_tiles = x.shape[1] // TILE
-    total_tiles = row_tiles * col_tiles
-    tiles_per_core = -(-total_tiles // grid_cols)
-    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+    col_blocks = x.shape[1] // TILE // ELEM_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, ELEM_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
+            if t < total:
                 with x_dfb.wait() as xv, out_dfb.reserve() as o:
                     o.store(xv * ttl.math.sigmoid(xv))
     @ttl.datamovement()
@@ -177,39 +183,41 @@ def silu_kernel(x, out):
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with x_dfb.reserve() as blk:
-                    tx = ttl.copy(x[row, col], blk); tx.wait()
+                    tx = ttl.copy(x[row, sc:sc + ELEM_GRAN], blk); tx.wait()
     @ttl.datamovement()
     def dm_write():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with out_dfb.wait() as blk:
-                    tx = ttl.copy(blk, out[row, col]); tx.wait()
+                    tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
 @ttl.kernel(grid="auto")
 def adaln_modulate_kernel(x, shift, scale, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = x.shape[0] // TILE
-    col_tiles = x.shape[1] // TILE
-    total_tiles = row_tiles * col_tiles
-    tiles_per_core = -(-total_tiles // grid_cols)
-    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-    sh_dfb = ttl.make_dataflow_buffer_like(shift, shape=(1, 1), buffer_factor=2)
-    sc_dfb = ttl.make_dataflow_buffer_like(scale, shape=(1, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+    col_blocks = x.shape[1] // TILE // ELEM_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, ELEM_GRAN), buffer_factor=2)
+    sh_dfb = ttl.make_dataflow_buffer_like(shift, shape=(1, ELEM_GRAN), buffer_factor=2)
+    sc_dfb = ttl.make_dataflow_buffer_like(scale, shape=(1, ELEM_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
+            if t < total:
                 with x_dfb.wait() as xv, sh_dfb.wait() as shv, sc_dfb.wait() as scv, out_dfb.reserve() as o:
                     o.store(xv * (scv + ttl.math.fill(scv, 1.0)) + shv)
     @ttl.datamovement()
@@ -217,43 +225,45 @@ def adaln_modulate_kernel(x, shift, scale, out):
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with x_dfb.reserve() as blk:
-                    tx = ttl.copy(x[row, col], blk); tx.wait()
+                    tx = ttl.copy(x[row, sc:sc + ELEM_GRAN], blk); tx.wait()
                 with sh_dfb.reserve() as blk:
-                    tx = ttl.copy(shift[row, col], blk); tx.wait()
+                    tx = ttl.copy(shift[row, sc:sc + ELEM_GRAN], blk); tx.wait()
                 with sc_dfb.reserve() as blk:
-                    tx = ttl.copy(scale[row, col], blk); tx.wait()
+                    tx = ttl.copy(scale[row, sc:sc + ELEM_GRAN], blk); tx.wait()
     @ttl.datamovement()
     def dm_write():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with out_dfb.wait() as blk:
-                    tx = ttl.copy(blk, out[row, col]); tx.wait()
+                    tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
 @ttl.kernel(grid="auto")
 def gated_residual_kernel(residual, x, gate, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = residual.shape[0] // TILE
-    col_tiles = residual.shape[1] // TILE
-    total_tiles = row_tiles * col_tiles
-    tiles_per_core = -(-total_tiles // grid_cols)
-    res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), buffer_factor=2)
-    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-    g_dfb = ttl.make_dataflow_buffer_like(gate, shape=(1, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+    col_blocks = residual.shape[1] // TILE // ELEM_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, ELEM_GRAN), buffer_factor=2)
+    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, ELEM_GRAN), buffer_factor=2)
+    g_dfb = ttl.make_dataflow_buffer_like(gate, shape=(1, ELEM_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
+            if t < total:
                 with res_dfb.wait() as rv, x_dfb.wait() as xv, g_dfb.wait() as gv, out_dfb.reserve() as o:
                     o.store(rv + xv * gv)
     @ttl.datamovement()
@@ -261,25 +271,27 @@ def gated_residual_kernel(residual, x, gate, out):
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with res_dfb.reserve() as blk:
-                    tx = ttl.copy(residual[row, col], blk); tx.wait()
+                    tx = ttl.copy(residual[row, sc:sc + ELEM_GRAN], blk); tx.wait()
                 with x_dfb.reserve() as blk:
-                    tx = ttl.copy(x[row, col], blk); tx.wait()
+                    tx = ttl.copy(x[row, sc:sc + ELEM_GRAN], blk); tx.wait()
                 with g_dfb.reserve() as blk:
-                    tx = ttl.copy(gate[row, col], blk); tx.wait()
+                    tx = ttl.copy(gate[row, sc:sc + ELEM_GRAN], blk); tx.wait()
     @ttl.datamovement()
     def dm_write():
         core_x, _ = ttl.core(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
-            if t < total_tiles:
-                row = t // col_tiles
-                col = t % col_tiles
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
                 with out_dfb.wait() as blk:
-                    tx = ttl.copy(blk, out[row, col]); tx.wait()
+                    tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
 def make_rmsnorm_kernel(dim_tiles):
     @ttl.kernel(grid="auto")
@@ -355,12 +367,157 @@ def make_rmsnorm_kernel(dim_tiles):
                             tx = ttl.copy(blk, out[tile_idx, j]); tx.wait()
     return rmsnorm_kernel
 
+def make_fused_norm_mod_kernel(dim_tiles):
+    """Fused RMSNorm + weight multiply + AdaLN modulate in one kernel.
+    Replaces: rmsnorm → mul(norm_w) → adaln_modulate(mu, sigma)."""
+    @ttl.kernel(grid="auto")
+    def fused_norm_mod(x, norm_w, mu, sigma, scaler, mean_scale, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        seq_tiles = x.shape[0] // TILE
+        tiles_per_core = -(-seq_tiles // grid_cols)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        nw_dfb = ttl.make_dataflow_buffer_like(norm_w, shape=(1, 1), buffer_factor=2)
+        mu_dfb = ttl.make_dataflow_buffer_like(mu, shape=(1, 1), buffer_factor=2)
+        sig_dfb = ttl.make_dataflow_buffer_like(sigma, shape=(1, 1), buffer_factor=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+        ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), buffer_factor=1)
+        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        bcast_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        rsq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            with sc_dfb.wait() as sc, ms_dfb.wait() as ms:
+                for local_t in range(tiles_per_core):
+                    tile_idx = core_x * tiles_per_core + local_t
+                    if tile_idx < seq_tiles:
+                        # Pass 1: sum of squares for RMSNorm
+                        with x_dfb.wait() as x0:
+                            with sq_dfb.reserve() as sq:
+                                sq.store(x0 * x0)
+                        with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                            r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                        with red_dfb.wait() as rv, acc_dfb.reserve() as acc:
+                            acc.store(rv)
+                        for j in range(dim_tiles - 1):
+                            with x_dfb.wait() as xj:
+                                with sq_dfb.reserve() as sq:
+                                    sq.store(xj * xj)
+                            with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                                r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                            with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as new_acc:
+                                new_acc.store(av + rv)
+                        with acc_dfb.wait() as total, bcast_dfb.reserve() as bc:
+                            bc.store(ttl.math.broadcast(total, dims=[1]))
+                        with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
+                            scaled.store(bv * ms + ttl.math.fill(bv, 1e-5))
+                        with red_dfb.wait() as msq, rsq_dfb.reserve() as rsq:
+                            rsq.store(ttl.math.rsqrt(msq))
+                        # Pass 2: normalize * weight * (1+sigma) + mu
+                        with rsq_dfb.wait() as rsqv:
+                            for j in range(dim_tiles):
+                                with x_dfb.wait() as xj, nw_dfb.wait() as nw, mu_dfb.wait() as muv, sig_dfb.wait() as sigv, out_dfb.reserve() as o:
+                                    normed = xj * rsqv * nw
+                                    o.store(normed * (sigv + ttl.math.fill(sigv, 1.0)) + muv)
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            with sc_dfb.reserve() as blk:
+                tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+            with ms_dfb.reserve() as blk:
+                tx = ttl.copy(mean_scale[0, 0], blk); tx.wait()
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    # Pass 1: x tiles for RMS
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                    # Pass 2: x + norm_w + mu + sigma
+                    for j in range(dim_tiles):
+                        with x_dfb.reserve() as blk:
+                            tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
+                        with nw_dfb.reserve() as blk:
+                            tx = ttl.copy(norm_w[tile_idx, j], blk); tx.wait()
+                        with mu_dfb.reserve() as blk:
+                            tx = ttl.copy(mu[tile_idx, j], blk); tx.wait()
+                        with sig_dfb.reserve() as blk:
+                            tx = ttl.copy(sigma[tile_idx, j], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                tile_idx = core_x * tiles_per_core + local_t
+                if tile_idx < seq_tiles:
+                    for j in range(dim_tiles):
+                        with out_dfb.wait() as blk:
+                            tx = ttl.copy(blk, out[tile_idx, j]); tx.wait()
+    return fused_norm_mod
+
+def make_fused_linear_bias_kernel(k_chunk):
+    """Fused linear + bias add in one kernel. Eliminates intermediate DRAM write."""
+    @ttl.kernel(grid="auto")
+    def linear_bias_kernel(x, w, bias, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        m_tiles = x.shape[0] // TILE
+        n_tiles = w.shape[1] // TILE
+        total_out = m_tiles * n_tiles
+        tiles_per_core = -(-total_out // grid_cols)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_chunk), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, 1), buffer_factor=2)
+        b_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, 1), buffer_factor=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    with x_dfb.wait() as xv, w_dfb.wait() as wv, mm_dfb.reserve() as mm:
+                        mm.store(xv @ wv)
+                    with mm_dfb.wait() as mmv, b_dfb.wait() as bv, out_dfb.reserve() as o:
+                        o.store(mmv + bv)
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    row = idx // n_tiles
+                    col = idx % n_tiles
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(x[row, 0:k_chunk], blk); tx.wait()
+                    with w_dfb.reserve() as blk:
+                        tx = ttl.copy(w[0:k_chunk, col], blk); tx.wait()
+                    with b_dfb.reserve() as blk:
+                        tx = ttl.copy(bias[row, col], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    row = idx // n_tiles
+                    col = idx % n_tiles
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[row, col]); tx.wait()
+    return linear_bias_kernel
+
 rmsnorm_d320 = make_rmsnorm_kernel(D_MODEL // TILE)
+fused_norm_mod_d320 = make_fused_norm_mod_kernel(D_MODEL // TILE)
 linear_k10 = make_linear_kernel(10)
 linear_k40 = make_linear_kernel(40)
+linear_bias_k10 = make_fused_linear_bias_kernel(10)
+linear_bias_k40 = make_fused_linear_bias_kernel(40)
 
 # Modulation broadcast kernels: read column chunks from (TILE, 1920) and broadcast to (SEQ_PADDED, D_MODEL)
 MOD_D_TILES = D_MODEL // TILE  # 10
+MOD_GRAN = 5  # column tiles per block (must divide MOD_D_TILES)
+MOD_COL_BLOCKS = MOD_D_TILES // MOD_GRAN  # 2
 
 def make_mod_broadcast_kernel(col_offset_tiles):
     """Broadcast + bias fused: read column slice from linear output row 0,
@@ -369,21 +526,21 @@ def make_mod_broadcast_kernel(col_offset_tiles):
     def mod_broadcast(src, bias, scaler, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         seq_tiles = SEQ_PADDED // TILE
-        total_tiles = seq_tiles * MOD_D_TILES
-        tiles_per_core = -(-total_tiles // grid_cols)
-        src_dfb = ttl.make_dataflow_buffer_like(src, shape=(1, 1), buffer_factor=2)
-        bias_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, 1), buffer_factor=2)
+        total_blocks = seq_tiles * MOD_COL_BLOCKS
+        tiles_per_core = -(-total_blocks // grid_cols)
+        src_dfb = ttl.make_dataflow_buffer_like(src, shape=(1, MOD_GRAN), buffer_factor=2)
+        bias_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, MOD_GRAN), buffer_factor=2)
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
-        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
-        bcast_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, MOD_GRAN), buffer_factor=2)
+        bcast_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, MOD_GRAN), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, MOD_GRAN), buffer_factor=2)
         @ttl.compute()
         def compute():
             core_x, _ = ttl.core(dims=2)
             with sc_dfb.wait() as sc:
                 for local_t in range(tiles_per_core):
                     t = core_x * tiles_per_core + local_t
-                    if t < total_tiles:
+                    if t < total_blocks:
                         with src_dfb.wait() as sv:
                             with red_dfb.reserve() as rd:
                                 rd.store(ttl.math.reduce_sum(sv, sc, dims=[0]))
@@ -398,23 +555,24 @@ def make_mod_broadcast_kernel(col_offset_tiles):
                 tx = ttl.copy(scaler[0, 0], blk); tx.wait()
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
-                if t < total_tiles:
-                    col = t % MOD_D_TILES
-                    row = t // MOD_D_TILES
+                if t < total_blocks:
+                    cb = t % MOD_COL_BLOCKS
+                    row = t // MOD_COL_BLOCKS
+                    sc_start = col_offset_tiles + cb * MOD_GRAN
                     with src_dfb.reserve() as blk:
-                        tx = ttl.copy(src[0, col_offset_tiles + col], blk); tx.wait()
+                        tx = ttl.copy(src[0, sc_start:sc_start + MOD_GRAN], blk); tx.wait()
                     with bias_dfb.reserve() as blk:
-                        tx = ttl.copy(bias[row, col], blk); tx.wait()
+                        tx = ttl.copy(bias[row, cb * MOD_GRAN:(cb + 1) * MOD_GRAN], blk); tx.wait()
         @ttl.datamovement()
         def dm_write():
             core_x, _ = ttl.core(dims=2)
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
-                if t < total_tiles:
-                    row = t // MOD_D_TILES
-                    col = t % MOD_D_TILES
+                if t < total_blocks:
+                    cb = t % MOD_COL_BLOCKS
+                    row = t // MOD_COL_BLOCKS
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[row, col]); tx.wait()
+                        tx = ttl.copy(blk, out[row, cb * MOD_GRAN:(cb + 1) * MOD_GRAN]); tx.wait()
     return mod_broadcast
 
 broadcast_mu1 = make_mod_broadcast_kernel(0)
@@ -653,17 +811,15 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
         broadcast_c2(scr['mod_a'], dev[f'{p}.mod_bias_c2'], scaler_tt, scr['c2'])
         block_timers['modulation'] += tnow() - t0
 
-        # RMSNorm1 + weight mul + adaln modulate
+        # Fused RMSNorm1 + weight mul + adaln modulate (3 kernels → 1)
         t0 = tnow()
-        rmsnorm_d320(z_cur, scaler_tt, mean_scale_tt, scr['d320_a'])
-        mul_kernel(scr['d320_a'], dev[f'{p}.norm1_w'], scr['d320_b'])
-        adaln_modulate_kernel(scr['d320_b'], scr['mu1'], scr['sigma1'], scr['d320_a'])
+        fused_norm_mod_d320(z_cur, dev[f'{p}.norm1_w'], scr['mu1'], scr['sigma1'],
+                            scaler_tt, mean_scale_tt, scr['d320_a'])
         block_timers['norm1_mod'] += tnow() - t0
 
-        # QKV projection
+        # Fused QKV projection + bias (2 kernels → 1)
         t0 = tnow()
-        linear_k10(scr['d320_a'], dev[f'{p}.qkv_w'], scr['d960_a'])
-        add_kernel(scr['d960_a'], dev[f'{p}.qkv_bias'], scr['d960_b'])
+        linear_bias_k10(scr['d320_a'], dev[f'{p}.qkv_w'], dev[f'{p}.qkv_bias'], scr['d960_b'])
         block_timers['qkv_proj'] += tnow() - t0
 
         # Host: QKV reshape, QK-norm, RoPE, pad, KV cache
@@ -713,10 +869,9 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
         attn_p[:SEQ] = attn_2d
         block_timers['sdpa'] += tnow() - t0
 
-        # O projection
+        # Fused O projection + bias (2 kernels → 1)
         t0 = tnow()
-        linear_k10(to_tt(attn_p, tt_device), dev[f'{p}.o_w'], scr['d320_a'])
-        add_kernel(scr['d320_a'], dev[f'{p}.o_bias'], scr['d320_b'])
+        linear_bias_k10(to_tt(attn_p, tt_device), dev[f'{p}.o_w'], dev[f'{p}.o_bias'], scr['d320_b'])
         block_timers['o_proj'] += tnow() - t0
 
         # Gated residual 1: z_next = z_cur + o_biased * c1
@@ -725,26 +880,19 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
         z_cur, z_next = z_next, z_cur  # swap
         block_timers['gated_res1'] += tnow() - t0
 
-        # RMSNorm2 + GEGLU
+        # Fused RMSNorm2 + weight mul + adaln modulate (3 kernels → 1)
         t0 = tnow()
-        rmsnorm_d320(z_cur, scaler_tt, mean_scale_tt, scr['d320_a'])
-        mul_kernel(scr['d320_a'], dev[f'{p}.norm2_w'], scr['d320_b'])
-        adaln_modulate_kernel(scr['d320_b'], scr['mu2'], scr['sigma2'], scr['d320_a'])
+        fused_norm_mod_d320(z_cur, dev[f'{p}.norm2_w'], scr['mu2'], scr['sigma2'],
+                            scaler_tt, mean_scale_tt, scr['d320_a'])
         block_timers['norm2_mod'] += tnow() - t0
 
         t0 = tnow()
-        # up_proj
-        linear_k10(scr['d320_a'], dev[f'{p}.geglu_up_w'], scr['d1280_a'])
-        add_kernel(scr['d1280_a'], dev[f'{p}.geglu_up_bias'], scr['d1280_b'])  # u_b in d1280_b
-        # gate
-        linear_k10(scr['d320_a'], dev[f'{p}.geglu_gate_w'], scr['d1280_a'])
-        add_kernel(scr['d1280_a'], dev[f'{p}.geglu_gate_bias'], scr['d1280_c'])  # g_b in d1280_c
-        silu_kernel(scr['d1280_c'], scr['d1280_a'])  # g_a in d1280_a
-        # u_b * g_a
-        mul_kernel(scr['d1280_b'], scr['d1280_a'], scr['d1280_c'])  # mid in d1280_c
-        # down proj
-        linear_k40(scr['d1280_c'], dev[f'{p}.geglu_down_w'], scr['d320_a'])
-        add_kernel(scr['d320_a'], dev[f'{p}.geglu_down_bias'], scr['d320_b'])
+        # Fused GEGLU: up + gate with bias, silu, mul, down with bias
+        linear_bias_k10(scr['d320_a'], dev[f'{p}.geglu_up_w'], dev[f'{p}.geglu_up_bias'], scr['d1280_b'])
+        linear_bias_k10(scr['d320_a'], dev[f'{p}.geglu_gate_w'], dev[f'{p}.geglu_gate_bias'], scr['d1280_c'])
+        silu_kernel(scr['d1280_c'], scr['d1280_a'])
+        mul_kernel(scr['d1280_b'], scr['d1280_a'], scr['d1280_c'])
+        linear_bias_k40(scr['d1280_c'], dev[f'{p}.geglu_down_w'], dev[f'{p}.geglu_down_bias'], scr['d320_b'])
         block_timers['geglu'] += tnow() - t0
 
         # Gated residual 2
