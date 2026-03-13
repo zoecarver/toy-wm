@@ -292,6 +292,11 @@ KNOWN ISSUES / GOTCHAS
    to 32 before calling ttnn.transformer.scaled_dot_product_attention.
    Pad with zeros, slice result back to d_head=16 after.
 
+5. ttnn SDPA SCALE PARAMETER. If the model uses QK-norm (RMSNorm on Q
+   and K before attention), you MUST pass scale=1.0. The default scale
+   is 1/sqrt(d_head_padded), which is wrong for QK-norm models. This
+   causes attention to be way too soft, producing gray/zero outputs.
+
 PROGRESS
 --------
   [DONE] K3/K4/K5 elementwise (add, mul, silu) - sim PASS
@@ -319,8 +324,14 @@ PROGRESS
          NOTE: ttnn conv2d API didn't work, host fallback is fine (24x24)
   [DONE] FULL FORWARD PASS - 8 blocks with real weights - hw PASS!
          Output: (1, 3, 24, 24), range [-4.2, 3.5], mean ~0
-  [TODO] Sampling loop (euler steps + CFG)
-  [TODO] Multi-frame autoregressive generation
+  [DONE] Sampling loop (euler steps + CFG=1.0) - hw PASS
+  [DONE] Multi-frame autoregressive generation with KV cache - hw PASS!
+         30 frames, 4.2s/frame, coherent Pong video.
+         CRITICAL FIX: must pass scale=1.0 to ttnn SDPA because the model
+         uses QK-norm (not 1/sqrt(d) scaling). Without scale=1.0, attention
+         is ~5.7x too soft, producing gray/zero frames.
+  [TODO] Optimize: reduce host-device copies (QK-norm, RoPE, head reshape)
+  [TODO] Optimize: L1 + pipes for kernel fusion
 
 OPEN QUESTIONS
 --------------
