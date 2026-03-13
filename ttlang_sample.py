@@ -778,6 +778,118 @@ def make_fused_norm_rope_kernel(qkv_col_offset):
 fused_q_norm_rope = make_fused_norm_rope_kernel(0)           # Q cols 0-19
 fused_k_norm_rope = make_fused_norm_rope_kernel(N_HEADS)     # K cols 20-39
 
+# Combined QK norm+rope: processes both Q and K in one kernel launch
+SEQ_TILES_QK = SEQ_PADDED // TILE  # 3
+
+@ttl.kernel(grid="auto")
+def fused_qk_norm_rope(qkv, lnq_w, lnk_w, sin_tab, cos_tab, perm, scaler, mean_scale, q_out, k_out):
+    """Fused QK norm+rope in one launch. First N_HEADS*SEQ_TILES tiles are Q, next are K."""
+    grid_cols, _ = ttl.grid_size(dims=2)
+    total_tiles = 2 * N_HEADS * SEQ_TILES_QK  # 120
+    tiles_per_core = -(-total_tiles // grid_cols)
+
+    x_dfb = ttl.make_dataflow_buffer_like(qkv, shape=(1, 1), buffer_factor=2)
+    nw_dfb = ttl.make_dataflow_buffer_like(lnq_w, shape=(1, 1), buffer_factor=2)
+    sin_dfb = ttl.make_dataflow_buffer_like(sin_tab, shape=(1, 1), buffer_factor=2)
+    cos_dfb = ttl.make_dataflow_buffer_like(cos_tab, shape=(1, 1), buffer_factor=2)
+    p_dfb = ttl.make_dataflow_buffer_like(perm, shape=(1, 1), buffer_factor=1)
+    sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+    ms_dfb = ttl.make_dataflow_buffer_like(mean_scale, shape=(1, 1), buffer_factor=1)
+
+    sq_dfb = ttl.make_dataflow_buffer_like(qkv, shape=(1, 1), buffer_factor=2)
+    red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    bcast_dfb = ttl.make_dataflow_buffer_like(qkv, shape=(1, 1), buffer_factor=2)
+    rsq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    pm_dfb = ttl.make_dataflow_buffer_like(qkv, shape=(1, 1), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(q_out, shape=(1, 1), buffer_factor=2)
+
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.core(dims=2)
+        with sc_dfb.wait() as sc, ms_dfb.wait() as ms, p_dfb.wait() as p:
+            for local_t in range(tiles_per_core):
+                t = core_x * tiles_per_core + local_t
+                if t < total_tiles:
+                    with x_dfb.wait() as x0:
+                        with sq_dfb.reserve() as sq:
+                            sq.store(x0 * x0)
+                    with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                        r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                    with red_dfb.wait() as rv, bcast_dfb.reserve() as bc:
+                        bc.store(ttl.math.broadcast(rv, dims=[1]))
+                    with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
+                        scaled.store(bv * ms + ttl.math.fill(bv, 1e-5))
+                    with red_dfb.wait() as msq, rsq_dfb.reserve() as rsq:
+                        rsq.store(ttl.math.rsqrt(msq))
+                    with rsq_dfb.wait() as rsqv:
+                        with x_dfb.wait() as x1, nw_dfb.wait() as nw, sq_dfb.reserve() as normed:
+                            normed.store(x1 * rsqv * nw)
+                        with sq_dfb.wait() as nv, pm_dfb.reserve() as pm:
+                            pm.store(nv @ p)
+                        with x_dfb.wait() as x2, nw_dfb.wait() as nw2, pm_dfb.wait() as pv, sin_dfb.wait() as sv, cos_dfb.wait() as cv, out_dfb.reserve() as o:
+                            o.store(cv * (x2 * rsqv * nw2) + sv * pv)
+
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.core(dims=2)
+        with sc_dfb.reserve() as blk:
+            tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+        with ms_dfb.reserve() as blk:
+            tx = ttl.copy(mean_scale[0, 0], blk); tx.wait()
+        with p_dfb.reserve() as blk:
+            tx = ttl.copy(perm[0, 0], blk); tx.wait()
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_tiles:
+                # First half: Q (col offset 0), second half: K (col offset N_HEADS)
+                half = t // (N_HEADS * SEQ_TILES_QK)
+                t_in_half = t % (N_HEADS * SEQ_TILES_QK)
+                head = t_in_half // SEQ_TILES_QK
+                seq_r = t_in_half % SEQ_TILES_QK
+                qkv_col = half * N_HEADS + head
+                out_row = head * SEQ_TILES_QK + seq_r
+                # Norm weight: Q uses lnq_w, K uses lnk_w
+                with x_dfb.reserve() as blk:
+                    tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
+                with x_dfb.reserve() as blk:
+                    tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
+                if half == 0:
+                    with nw_dfb.reserve() as blk:
+                        tx = ttl.copy(lnq_w[out_row, 0], blk); tx.wait()
+                if half == 1:
+                    with nw_dfb.reserve() as blk:
+                        tx = ttl.copy(lnk_w[out_row, 0], blk); tx.wait()
+                with x_dfb.reserve() as blk:
+                    tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
+                if half == 0:
+                    with nw_dfb.reserve() as blk:
+                        tx = ttl.copy(lnq_w[out_row, 0], blk); tx.wait()
+                if half == 1:
+                    with nw_dfb.reserve() as blk:
+                        tx = ttl.copy(lnk_w[out_row, 0], blk); tx.wait()
+                with sin_dfb.reserve() as blk:
+                    tx = ttl.copy(sin_tab[out_row, 0], blk); tx.wait()
+                with cos_dfb.reserve() as blk:
+                    tx = ttl.copy(cos_tab[out_row, 0], blk); tx.wait()
+
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_tiles:
+                half = t // (N_HEADS * SEQ_TILES_QK)
+                t_in_half = t % (N_HEADS * SEQ_TILES_QK)
+                head = t_in_half // SEQ_TILES_QK
+                seq_r = t_in_half % SEQ_TILES_QK
+                out_row = head * SEQ_TILES_QK + seq_r
+                if half == 0:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, q_out[out_row, 0]); tx.wait()
+                if half == 1:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, k_out[out_row, 0]); tx.wait()
+
 
 rmsnorm_d320 = make_rmsnorm_kernel(D_MODEL // TILE)
 rmsnorm_d1 = make_rmsnorm_kernel(1)  # for QK-norm over D_HEAD_PAD=32 (1 tile)
@@ -1256,18 +1368,14 @@ def dit_forward(z_frame, time_pe_tt, cond_bias_action_tt, state, dev, scr, tt_de
 
         t0 = tnow()
 
-        fused_q_norm_rope(scr['qkv_out'], dev[f'{p}.lnq_w'],
-                          rope_tables[block_idx][0], rope_tables[block_idx][1],
-                          dev['rope_perm'], scaler_tt, mean_scale_16_tt, scr['hb_c'])
+        fused_qk_norm_rope(scr['qkv_out'], dev[f'{p}.lnq_w'], dev[f'{p}.lnk_w'],
+                           rope_tables[block_idx][0], rope_tables[block_idx][1],
+                           dev['rope_perm'], scaler_tt, mean_scale_16_tt,
+                           scr['hb_c'], scr['hb_b'])
         q_sdpa = ttnn.reshape(scr['hb_c'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
-        t_q = tnow() - t0
-
-        t1 = tnow()
-        fused_k_norm_rope(scr['qkv_out'], dev[f'{p}.lnk_w'],
-                          rope_tables[block_idx][0], rope_tables[block_idx][1],
-                          dev['rope_perm'], scaler_tt, mean_scale_16_tt, scr['hb_b'])
         k_new = ttnn.reshape(scr['hb_b'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
-        t_k = tnow() - t1
+        t_q = tnow() - t0
+        t_k = 0.0
 
         t1 = tnow()
         v_flat = ttnn.slice(scr['qkv_out'],
