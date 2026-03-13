@@ -207,6 +207,51 @@ def silu_kernel(x, out):
                 with out_dfb.wait() as blk:
                     tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
+@ttl.kernel(grid="auto")
+def add_silu_kernel(a, b, out):
+    """Fused add + silu: out = silu(a + b). Saves one kernel launch."""
+    grid_cols, _ = ttl.grid_size(dims=2)
+    row_tiles = a.shape[0] // TILE
+    col_blocks = a.shape[1] // TILE // ELEM_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, ELEM_GRAN), buffer_factor=2)
+    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, ELEM_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, ELEM_GRAN), buffer_factor=2)
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                with a_dfb.wait() as av, b_dfb.wait() as bv, out_dfb.reserve() as o:
+                    s = av + bv
+                    o.store(s * ttl.math.sigmoid(s))
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
+                with a_dfb.reserve() as blk:
+                    tx = ttl.copy(a[row, sc:sc + ELEM_GRAN], blk); tx.wait()
+                with b_dfb.reserve() as blk:
+                    tx = ttl.copy(b[row, sc:sc + ELEM_GRAN], blk); tx.wait()
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * ELEM_GRAN
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
+
 SILU_MUL_GRAN = 10  # wider blocks for silu_mul (divides 40, 80)
 
 @ttl.kernel(grid="auto")
@@ -561,6 +606,68 @@ def make_fused_linear_bias_kernel(k_chunk, n_chunk=1):
                         tx = ttl.copy(blk, out[row, sc:sc + n_chunk]); tx.wait()
     return linear_bias_kernel
 
+def make_fused_linear_bias_gated_res_kernel(k_chunk, n_chunk=1):
+    """Fused linear + bias + gated residual: out = residual + (x @ w + bias) * gate.
+    Eliminates DRAM round-trip between linear_bias and gated_residual."""
+    @ttl.kernel(grid="auto")
+    def fused_lbgr(x, w, bias, residual, gate, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        m_tiles = x.shape[0] // TILE
+        n_blocks = w.shape[1] // TILE // n_chunk
+        total_out = m_tiles * n_blocks
+        tiles_per_core = -(-total_out // grid_cols)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_chunk), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, n_chunk), buffer_factor=2)
+        b_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, n_chunk), buffer_factor=2)
+        res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, n_chunk), buffer_factor=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gate, shape=(1, n_chunk), buffer_factor=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, n_chunk), buffer_factor=2)
+        tmp_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, n_chunk), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, n_chunk), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    with x_dfb.wait() as xv, w_dfb.wait() as wv, mm_dfb.reserve() as mm:
+                        mm.store(xv @ wv)
+                    with mm_dfb.wait() as mmv, b_dfb.wait() as bv, tmp_dfb.reserve() as tmp:
+                        tmp.store(mmv + bv)
+                    with tmp_dfb.wait() as tv, res_dfb.wait() as rv, g_dfb.wait() as gv, out_dfb.reserve() as o:
+                        o.store(rv + tv * gv)
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    row = idx // n_blocks
+                    cb = idx % n_blocks
+                    sc = cb * n_chunk
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(x[row, 0:k_chunk], blk); tx.wait()
+                    with w_dfb.reserve() as blk:
+                        tx = ttl.copy(w[0:k_chunk, sc:sc + n_chunk], blk); tx.wait()
+                    with b_dfb.reserve() as blk:
+                        tx = ttl.copy(bias[row, sc:sc + n_chunk], blk); tx.wait()
+                    with res_dfb.reserve() as blk:
+                        tx = ttl.copy(residual[row, sc:sc + n_chunk], blk); tx.wait()
+                    with g_dfb.reserve() as blk:
+                        tx = ttl.copy(gate[row, sc:sc + n_chunk], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                idx = core_x * tiles_per_core + local_t
+                if idx < total_out:
+                    cb = idx % n_blocks
+                    row = idx // n_blocks
+                    sc = cb * n_chunk
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[row, sc:sc + n_chunk]); tx.wait()
+    return fused_lbgr
+
 def make_fused_norm_rope_kernel(qkv_col_offset):
     """Fused RMSNorm + weight mul + RoPE in one kernel.
     Reads head tiles directly from qkv_out at col_offset, writes to head-batched output.
@@ -677,6 +784,9 @@ linear_k40 = make_linear_kernel(40)
 linear_bias_k10 = make_fused_linear_bias_kernel(10, n_chunk=5)
 linear_bias_k20 = make_fused_linear_bias_kernel(20, n_chunk=5)  # for O proj with padded input (640/32=20)
 linear_bias_k40 = make_fused_linear_bias_kernel(40, n_chunk=5)
+# Fused linear+bias+gated_residual: eliminates DRAM round-trip between matmul and residual add
+linear_bias_gated_res_k20 = make_fused_linear_bias_gated_res_kernel(20, n_chunk=5)  # O proj + gated_res1
+linear_bias_gated_res_k40 = make_fused_linear_bias_gated_res_kernel(40, n_chunk=5)  # GEGLU down + gated_res2
 
 # Fused modulation broadcast: all 6 params (mu1,sig1,c1,mu2,sig2,c2) in one kernel.
 # 6 separate kernels → 1 kernel, saving 5 launch overheads per block.
@@ -1115,8 +1225,8 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
 
     block_timers = {k: 0.0 for k in [
         'modulation', 'norm1_mod', 'qkv_proj',
-        'host_attn', 'sdpa', 'o_proj', 'gated_res1',
-        'norm2_mod', 'geglu', 'gated_res2'
+        'host_attn', 'sdpa', 'o_proj',
+        'norm2_mod', 'geglu'
     ]}
 
     for block_idx in range(N_BLOCKS):
@@ -1197,13 +1307,10 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
                         'kv_cache': t_kv_cache, 'sdpa': t_sdpa, 'out_reshape': t_out_reshape}
 
         t0 = tnow()
-        linear_bias_k20(attn_2d, dev[f'{p}.o_w'], dev[f'{p}.o_bias'], scr['d320_b'])
-        block_timers['o_proj'] += tnow() - t0
-
-        t0 = tnow()
-        gated_residual_kernel(z_cur, scr['d320_b'], scr['c1'], z_next)
+        linear_bias_gated_res_k20(attn_2d, dev[f'{p}.o_w'], dev[f'{p}.o_bias'],
+                                   z_cur, scr['c1'], z_next)
         z_cur, z_next = z_next, z_cur
-        block_timers['gated_res1'] += tnow() - t0
+        block_timers['o_proj'] += tnow() - t0
 
         t0 = tnow()
         fused_norm_mod_d320(z_cur, dev[f'{p}.norm2_w'], scr['mu2'], scr['sigma2'],
@@ -1215,13 +1322,10 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         up_part = ttnn.slice(scr['d2560'], [0, 0], [SEQ_PADDED, D_MID])
         gate_part = ttnn.slice(scr['d2560'], [0, D_MID], [SEQ_PADDED, 2 * D_MID])
         silu_mul_kernel(up_part, gate_part, scr['d1280_a'])
-        linear_bias_k40(scr['d1280_a'], dev[f'{p}.geglu_down_w'], dev[f'{p}.geglu_down_bias'], scr['d320_b'])
-        block_timers['geglu'] += tnow() - t0
-
-        t0 = tnow()
-        gated_residual_kernel(z_cur, scr['d320_b'], scr['c2'], z_next)
+        linear_bias_gated_res_k40(scr['d1280_a'], dev[f'{p}.geglu_down_w'], dev[f'{p}.geglu_down_bias'],
+                                   z_cur, scr['c2'], z_next)
         z_cur, z_next = z_next, z_cur
-        block_timers['gated_res2'] += tnow() - t0
+        block_timers['geglu'] += tnow() - t0
 
     t0 = tnow()
     # Fuse: linear+bias (was linear+add), then broadcast, then fused norm+mod (was rmsnorm+mul+adaln)

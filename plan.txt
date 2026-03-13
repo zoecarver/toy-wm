@@ -1,0 +1,356 @@
+Toy World Model on Tenstorrent: TT-Lang Implementation Plan
+============================================================
+
+GOAL: Run the toy-wm (Pong diffusion world model) ENTIRELY on TT hardware.
+No host-device copies between kernels. All compute stays on device. Tensors
+live in DRAM between kernel invocations. Architecture should be set up for
+streaming so we can later move to L1 + pipes for performance.
+
+The model is a CausalDiT: 8-block diffusion transformer with d_model=320,
+20 heads (d_head=16), patch_size=3, 24x24 frames, 30-frame context window.
+Weights available on HuggingFace (chrisxx/pong).
+
+DESIGN PRINCIPLES
+-----------------
+1. EVERYTHING ON DEVICE. Even cheap ops (embeddings, RoPE, reshaping) get
+   TT-Lang kernels so we never copy between host and device mid-inference.
+   The only host-device transfers are: weights at load time, input frame +
+   action at start, output frame at end.
+
+2. DRAM-BACKED TENSORS BETWEEN KERNELS. Each kernel reads from DRAM and
+   writes to DRAM. We invoke kernels sequentially. This is correct and
+   simple. Later we fuse kernels and use L1/pipes to avoid DRAM round-trips.
+
+3. STREAMING ARCHITECTURE. Every kernel uses grid="auto" with streaming
+   loops so it naturally scales to multiple cores and handles arbitrary
+   tensor sizes. This makes the eventual transition to L1+pipes easier.
+
+4. ATTENTION VIA ttnn.transformer.scaled_dot_product_attention. This
+   handles d_head=16, causal masking, and KV cache natively. Later we can
+   promote to a custom TT-Lang SDPA kernel.
+
+5. TEST EACH KERNEL IN ISOLATION against PyTorch reference before wiring
+   together. Each kernel file has a __main__ block that creates random
+   inputs, runs the TT-Lang kernel, and compares to torch output.
+
+MODEL ARCHITECTURE SUMMARY
+--------------------------
+Input: (B, T, 3, 24, 24) frames + actions + noise timesteps
+  1. Patch:     Conv2d pipeline + linear -> (B, T, 65, 320)
+  2. Flatten:   (B, 1950, 320)  [1950 = 30 * 65]
+  3. 8x CausalBlock:
+     a. AdaLN modulation (from time+action embedding)
+     b. RMSNorm -> Attention (QKV, QK-norm, RoPE, causal mask, KV cache)
+     c. Gated residual
+     d. RMSNorm -> GEGLU MLP (320 -> 1280 -> 320)
+     e. Gated residual
+  4. Final modulation + RMSNorm
+  5. UnPatch:   linear -> (B, T, 3, 24, 24)
+
+KEY DIMENSIONS
+--------------
+  d_model = 320 = 10 tiles
+  d_head  = 16  (sub-tile; handled by ttnn SDPA natively)
+  n_heads = 20
+  d_mid   = 1280 = 40 tiles (GEGLU expansion)
+  seq_per_frame = 65 -> pad to 96 (3 tiles) for tile alignment
+  full_seq = 1950 -> pad to 1952 (61 tiles)
+
+KERNEL INVENTORY
+================
+Each kernel is a separate file in ttlang/kernels/. Each has a standalone
+test in its __main__. All kernels use grid="auto" + streaming.
+
+  K1. rmsnorm_kernel(x, weight, scaler, mean_scale, out)
+      - RMSNorm: out = (x / rms(x)) * weight
+      - Input: (seq_tiles, dim_tiles), weight broadcast per row
+      - Pattern: nanochat rmsnorm factory (sum-of-squares reduction,
+        broadcast rsqrt, multiply)
+      - dim_tiles parameterized: 10 for d_model=320, 40 for d_mid=1280
+
+  K2. linear_kernel(x, w, bias, out)
+      - out = x @ w + bias (bias optional, can be zero tensor)
+      - Pattern: nanochat linear_kernel with k_chunk
+      - Used for: QKV proj, O proj, GEGLU up/gate/down, modulation,
+        time_emb mixer, unpatch linear, patch x_embedder
+
+  K3. silu_kernel(x, out)
+      - out = x * sigmoid(x)
+      - Simple streaming elementwise
+
+  K4. mul_kernel(a, b, out)
+      - out = a * b
+      - Streaming elementwise, used for GEGLU gating and more
+
+  K5. add_kernel(a, b, out)
+      - out = a + b
+      - Streaming elementwise, used for residual connections
+
+  K6. adaln_modulate_kernel(x, shift, scale, out)
+      - out = x * (1 + scale) + shift
+      - shift/scale are per-frame (broadcast across tokens within frame)
+      - Streaming with broadcast pattern
+
+  K7. gated_residual_kernel(residual, x, gate, out)
+      - out = residual + x * gate
+      - gate is per-frame (broadcast across tokens)
+      - Could fuse with K5+K4 but cleaner as its own kernel
+
+  K8. rope_kernel(x, cos_table, sin_table, out)
+      - RoPE: out = cos*x + sin*x_perm (x_perm swaps even/odd with negation)
+      - Precompute cos/sin tables as device tensors at init time
+      - Operates on (seq, d_head) per head, or on packed (seq, d_model)
+
+  K9. embedding_lookup_kernel(indices, table, out)
+      - out[i] = table[indices[i]]
+      - For action embedding (4 actions -> d_model=320)
+      - For timestep: sinusoidal encoding as precomputed table
+
+  K10. conv2d_kernel (for Patch module)
+       - 5x5 conv, stride 1, padding 2, on 24x24 images
+       - Implement as im2col + matmul, or as direct sliding-window DMA
+       - Two conv layers: (3->160, 24x24) and (160->160, 24x24)
+       - Small enough that a naive approach is fine
+
+  K11. patchify_kernel / unpatchify_kernel
+       - Tile rearrangement: (C, H, W) -> (n_patches, patch_dim)
+       - Pure data movement, no compute
+
+  K12. groupnorm_kernel (for Patch module)
+       - GroupNorm(32, 160): 32 groups of 5 channels each
+       - Normalize within each group
+
+  K13. chunk_split_kernel
+       - Split a tensor along a dimension (for QKV split, modulation chunk)
+       - Pure data movement
+
+  K14. concat_register_kernel
+       - Prepend the learned register token to each frame's patch sequence
+       - Data movement + broadcast of the register vector
+
+  K15. sdpa_attention (via ttnn for now)
+       - Use ttnn.transformer.scaled_dot_product_attention
+       - Handles Q/K/V with d_head=16, causal mask, scaling
+       - Future: promote to custom TT-Lang SDPA kernel
+
+  K16. euler_step_kernel(z, v_pred, dt, out)
+       - out = z + dt * v_pred
+       - Simple fused multiply-add, streaming
+
+  K17. cfg_blend_kernel(v_cond, v_uncond, cfg_scale, out)
+       - out = v_uncond + cfg_scale * (v_cond - v_uncond)
+       - Streaming elementwise
+
+  K18. sinusoidal_encoding_kernel(timesteps, out)
+       - Compute sinusoidal positional encoding on device
+       - Or: precompute table, use lookup
+
+IMPLEMENTATION PHASES
+=====================
+
+PHASE 1: Foundational Kernels
+------------------------------
+Write and test in isolation against PyTorch:
+  - K1 rmsnorm (port from nanochat, change dim_tiles to 10)
+  - K2 linear (port from nanochat)
+  - K3 silu
+  - K4 mul
+  - K5 add
+These are proven patterns. Should go fast.
+
+PHASE 2: Transformer Block Internals
+--------------------------------------
+  - K6 adaln_modulate
+  - K7 gated_residual
+  - K8 rope (precompute sin/cos tables on device)
+  - K13 chunk_split (for QKV split and modulation params)
+  - K15 sdpa via ttnn.transformer.scaled_dot_product_attention
+Wire these into a single CausalBlock test: load one block's weights,
+run the full block, compare to PyTorch.
+
+PHASE 3: GEGLU MLP
+-------------------
+  - Compose: K2(up_proj) -> K4(mul with K3(silu(K2(up_gate)))) -> K2(down)
+  - All tensors stay in DRAM between kernel calls
+  - Test as unit against PyTorch GEGLU
+
+PHASE 4: Patch / UnPatch / Embeddings
+--------------------------------------
+  - K10 conv2d (im2col + matmul or direct)
+  - K11 patchify / unpatchify
+  - K12 groupnorm
+  - K9 embedding lookup (action + time)
+  - K14 register token concat
+  - K2 linear for x_embedder and unpatch linear
+These are needed for the full forward pass but are not on the critical path
+for the transformer blocks.
+
+PHASE 5: Full Forward Pass
+---------------------------
+  - Wire all kernels together: embed -> patch -> 8 blocks -> norm -> unpatch
+  - All tensors on device, sequential kernel invocations
+  - Load full model weights as device tensors at startup
+  - Compare against PyTorch model output
+
+PHASE 6: Sampling Loop
+-----------------------
+  - K16 euler_step
+  - K17 cfg_blend
+  - KV cache management (DRAM tensors, updated in-place or via copy kernels)
+  - Orchestrate: noise -> denoise loop -> clean frame
+  - Frame-by-frame autoregressive generation
+
+PHASE 7: Optimization (L1 + Pipes)
+------------------------------------
+  - Fuse kernel chains to reduce DRAM round-trips:
+    * RMSNorm + modulate -> single kernel
+    * GEGLU (up + gate + silu + mul + down) -> fused kernel
+    * Residual + gate -> fused with previous output
+  - Move intermediate tensors from DRAM to L1 via pipes
+  - Custom TT-Lang SDPA kernel (promote from ttnn)
+  - Pipeline across transformer blocks
+
+PHASE 8: Interactive Demo
+--------------------------
+  - Port play_pong.py to use TT backend
+  - Only host-device transfer: send action, receive frame
+  - WebSocket server for real-time play
+
+FILE STRUCTURE
+==============
+ttlang/
+  kernels/
+    rmsnorm.py        # K1
+    linear.py         # K2
+    elementwise.py    # K3, K4, K5
+    adaln.py          # K6
+    gated_residual.py # K7
+    rope.py           # K8
+    embedding.py      # K9
+    conv2d.py         # K10
+    patchify.py       # K11
+    groupnorm.py      # K12
+    data_movement.py  # K13, K14
+    sampling.py       # K16, K17
+  model.py            # Full model wiring (CausalDiT on TT)
+  weights.py          # Weight loading and preparation
+  inference.py        # Sampling loop + demo
+  test_block.py       # Single block test
+  test_forward.py     # Full forward pass test
+
+WEIGHT PREPARATION
+==================
+At startup (one-time cost):
+  1. Load PyTorch checkpoint on host
+  2. Reshape all weights to 2D tile-aligned bfloat16
+  3. ttnn.from_torch() each weight tensor to device DRAM
+  4. Store as a dict of device tensors
+  5. Also precompute and send to device:
+     - RoPE sin/cos tables
+     - Sinusoidal time encoding table
+     - Learned register token (broadcast to tile-aligned shape)
+     - Scaler/mean_scale constants for RMSNorm
+
+This is the ONLY host->device transfer. Everything else stays on device.
+
+TESTING STRATEGY
+================
+Each kernel has a __main__ test block:
+  1. Create random input tensors (torch)
+  2. Compute expected output (torch)
+  3. Send inputs to device (ttnn.from_torch)
+  4. Run TT-Lang kernel
+  5. Read output back (ttnn.to_torch)
+  6. Compare: assert allclose with tolerance for bfloat16
+
+Integration tests build up incrementally:
+  - Single block (all kernels for one CausalBlock)
+  - Full forward (8 blocks + patch + unpatch)
+  - Single denoise step (forward + euler step)
+  - Full sample (multi-step denoise + KV cache)
+
+KNOWN ISSUES / GOTCHAS
+-----------------------
+1. SIM "pop() after WAIT" ERROR: The simulator reports:
+     "Cannot perform pop(): Expected one of [STORE_SRC], but got pop().
+      Current state: Acquisition=WAIT, Thread=COMPUTE, Access=MR"
+   when buffer_factor=1 DFBs are held in a `with` scope across a loop.
+   This is the sim being overly strict. The pattern works on HW. When you
+   see this error, skip the sim and run on HW directly (--hw flag).
+
+2. ALL DEFINED DFBs MUST BE USED. If you define a DFB with
+   make_dataflow_buffer_like but never use it in any thread, you get:
+     "Missing CB config for index N"
+   at runtime. Every DFB must appear in at least one reserve/wait.
+
+3. NO STRING CAPTURES IN KERNELS. The compiler cannot handle captured
+   string variables. A factory like make_kernel("add") that captures the
+   string "add" will fail with "Unhandled capture for vars of type(str)".
+   Use separate kernel definitions or capture only numeric constants.
+
+4. ttnn SDPA REQUIRES d_head = TILE-ALIGNED. d_head=16 must be padded
+   to 32 before calling ttnn.transformer.scaled_dot_product_attention.
+   Pad with zeros, slice result back to d_head=16 after.
+
+5. ttnn SDPA SCALE PARAMETER. If the model uses QK-norm (RMSNorm on Q
+   and K before attention), you MUST pass scale=1.0. The default scale
+   is 1/sqrt(d_head_padded), which is wrong for QK-norm models. This
+   causes attention to be way too soft, producing gray/zero outputs.
+
+PROGRESS
+--------
+  [DONE] K3/K4/K5 elementwise (add, mul, silu) - sim PASS
+  [DONE] K1 rmsnorm (no weight, nanochat pattern) - hw PASS (max_diff=0.047)
+  [DONE] K2 linear (k_chunk=10 and k_chunk=40) - sim PASS (max_diff<0.002)
+  [DONE] K6 adaln_modulate - sim PASS (max_diff=0.016)
+  [DONE] K7 gated_residual - sim PASS (max_diff=0.031)
+  [DONE] K16 euler_step - hw PASS (max_diff=0.016)
+  [DONE] K17 cfg_blend - hw PASS (max_diff=0.008)
+  [DONE] GEGLU integration (7 kernel calls composed) - sim PASS (max_diff=0.000122)
+  [TODO] K8 rope
+  [TODO] K9 embedding
+  [TODO] K10-K14 patch/unpatch/conv/groupnorm
+  [DONE] K8 rope (precomputed tables + mul + add) - sim PASS (max_diff=0.002)
+  [DONE] K15 sdpa via ttnn.transformer.scaled_dot_product_attention
+         NOTE: d_head=16 must be padded to 32 before SDPA, sliced back after.
+         hw PASS (max_diff=0.003)
+  [DONE] GEGLU integration (7 kernel calls composed) - sim PASS (max_diff=0.000122)
+  [DONE] Single CausalBlock (~20 kernel calls) - hw PASS (max_diff=0.004)
+         NOTE: QK-norm + head reshape + SDPA padding done on host for now.
+         These can be moved to device with ttnn ops later.
+  [DONE] Weight loading from checkpoint - hw PASS (38MB, 20M params)
+  [DONE] Embeddings (sinusoidal + action + mixer linear) - sim PASS
+  [DONE] Patch on host (conv2d+groupnorm+patchify+x_embedder) - works
+         NOTE: ttnn conv2d API didn't work, host fallback is fine (24x24)
+  [DONE] FULL FORWARD PASS - 8 blocks with real weights - hw PASS!
+         Output: (1, 3, 24, 24), range [-4.2, 3.5], mean ~0
+  [DONE] Sampling loop (euler steps + CFG=1.0) - hw PASS
+  [DONE] Multi-frame autoregressive generation with KV cache - hw PASS!
+         30 frames, 4.2s/frame, coherent Pong video.
+         CRITICAL FIX: must pass scale=1.0 to ttnn SDPA because the model
+         uses QK-norm (not 1/sqrt(d) scaling). Without scale=1.0, attention
+         is ~5.7x too soft, producing gray/zero frames.
+  [TODO] Optimize: reduce host-device copies (QK-norm, RoPE, head reshape)
+  [TODO] Optimize: L1 + pipes for kernel fusion
+
+OPEN QUESTIONS
+--------------
+1. N-dimensional tensor shapes: TT-Lang supports 3D+ tensors and DFBs.
+   This could simplify head-splitting (keep as (seq, n_heads, d_head))
+   instead of flattening to 2D. Need to test with sub-tile d_head=16.
+
+2. ttnn.transformer.scaled_dot_product_attention API: need to verify
+   exact signature (does it take a causal mask? KV cache? What format?).
+   Will test this early in Phase 2.
+
+3. Conv2d in Patch module: the model uses 5x5 convolutions with GroupNorm.
+   These are small (24x24) so even a naive im2col approach is fine. But
+   if ttnn has conv2d ops, we should use those.
+
+4. Custom SDPA kernel (future): we have a reference SDPA kernel that could
+   be adapted for d_head=16. This is a Phase 7 optimization.
+
+5. KV cache on device: need a strategy for the rolling buffer. Options:
+   a) Overwrite slices of a large DRAM tensor (in-place update kernel)
+   b) Concat new KV to existing (copy + append kernel)
+   c) Use ttnn tensor slicing if available
