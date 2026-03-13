@@ -1196,16 +1196,15 @@ def prealloc_scratch(tt_device):
 # Forward pass with pre-cached weights + scratch reuse
 # ============================================================
 
-def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+def dit_forward(z_frame, time_pe_tt, cond_bias_action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
                 mean_scale_16_tt, rope_tables, device_kv_cache=None, frame_idx=0):
     """Forward pass. Patch/unpatch per step (nonlinear), conditioning + final_mod on device."""
     timers = {}
     def tnow(): return time.time()
 
     t0 = tnow()
-    # Conditioning: fused linear+bias, then add action + silu
-    linear_bias_k10(time_pe_tt, dev['mixer_w'], dev['mixer_bias'], scr['cond_b'])
-    add_kernel(scr['cond_b'], action_tt, scr['cond_a'])
+    # Conditioning: linear+bias (bias includes action), then silu
+    linear_bias_k10(time_pe_tt, dev['mixer_w'], cond_bias_action_tt, scr['cond_a'])
     silu_kernel(scr['cond_a'], scr['cond_silu'])
     timers['conditioning'] = tnow() - t0
 
@@ -1375,6 +1374,8 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
     action_padded = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
     action_padded[0] = state["action_emb.weight"][action_idx]
     action_tt = to_tt(action_padded, tt_device)
+    # Pre-combine mixer_bias + action: conditioning becomes linear_bias + silu (2 kernels, not 3)
+    cond_bias_action_tt = ttnn.add(dev['mixer_bias'], action_tt)
 
     # Pre-cache all timestep conditioning tensors
     time_pe_tts = []
@@ -1398,13 +1399,13 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
         dt = (ts[i] - ts[i+1]).item()
 
         v_cond, new_device_kv = dit_forward(
-            z, time_pe_tts[i], action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+            z, time_pe_tts[i], cond_bias_action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
             mean_scale_16_tt, rope_tables, device_kv_cache=device_kv_cache, frame_idx=frame_idx)
 
         if cfg > 0 and cfg != 1.0:
+            # For unconditioned pass, use mixer_bias without action
             v_uncond, _ = dit_forward(
-                z, time_pe_tts[i], to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device),
-                state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+                z, time_pe_tts[i], dev['mixer_bias'], state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
                 mean_scale_16_tt, rope_tables, device_kv_cache=device_kv_cache, frame_idx=frame_idx)
             v_pred = v_uncond.float() + cfg * (v_cond.float() - v_uncond.float())
         else:
