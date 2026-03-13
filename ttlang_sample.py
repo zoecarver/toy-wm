@@ -688,35 +688,29 @@ MOD_BLOCKS_PER_MOD = MOD_SEQ_TILES * MOD_COL_BLOCKS  # 6
 
 @ttl.kernel(grid="auto")
 def mod_broadcast_all(src, b1, b2, b3, b4, b5, b6, scaler, o1, o2, o3, o4, o5, o6):
-    """Broadcast all 6 modulation params from linear output row 0 + bias in one kernel."""
+    """Broadcast all 6 modulation params from linear output row 0 + bias in one kernel.
+    Row 0 of src contains the linear output (other rows are zero from single-row matmul).
+    broadcast(dims=[0]) replicates row 0 within each tile to all 32 rows."""
     grid_cols, _ = ttl.grid_size(dims=2)
     total_blocks = N_MODS * MOD_BLOCKS_PER_MOD  # 6 * 6 = 36
     tiles_per_core = -(-total_blocks // grid_cols)
     src_dfb = ttl.make_dataflow_buffer_like(src, shape=(1, MOD_GRAN), buffer_factor=2)
     bias_dfb = ttl.make_dataflow_buffer_like(b1, shape=(1, MOD_GRAN), buffer_factor=2)
-    sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
-    red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, MOD_GRAN), buffer_factor=2)
     bcast_dfb = ttl.make_dataflow_buffer_like(o1, shape=(1, MOD_GRAN), buffer_factor=2)
     out_dfb = ttl.make_dataflow_buffer_like(o1, shape=(1, MOD_GRAN), buffer_factor=2)
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
-        with sc_dfb.wait() as sc:
-            for local_t in range(tiles_per_core):
-                t = core_x * tiles_per_core + local_t
-                if t < total_blocks:
-                    with src_dfb.wait() as sv:
-                        with red_dfb.reserve() as rd:
-                            rd.store(ttl.math.reduce_sum(sv, sc, dims=[0]))
-                    with red_dfb.wait() as rdv, bcast_dfb.reserve() as bc:
-                        bc.store(ttl.math.broadcast(rdv, dims=[0]))
-                    with bcast_dfb.wait() as bcv, bias_dfb.wait() as bv, out_dfb.reserve() as o:
-                        o.store(bcv + bv)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_blocks:
+                with src_dfb.wait() as sv, bcast_dfb.reserve() as bc:
+                    bc.store(ttl.math.broadcast(sv, dims=[0]))
+                with bcast_dfb.wait() as bcv, bias_dfb.wait() as bv, out_dfb.reserve() as o:
+                    o.store(bcv + bv)
     @ttl.datamovement()
     def dm_read():
         core_x, _ = ttl.core(dims=2)
-        with sc_dfb.reserve() as blk:
-            tx = ttl.copy(scaler[0, 0], blk); tx.wait()
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_blocks:
@@ -784,34 +778,27 @@ FMOD_BLOCKS_PER_MOD = MOD_SEQ_TILES * (MOD_D_TILES // MOD_GRAN)  # 3 * 2 = 6
 
 @ttl.kernel(grid="auto")
 def final_mod_broadcast(src, scaler, mu_out, sig_out):
-    """Broadcast final modulation from (TILE, 640) row 0 to mu/sigma (SEQ_PADDED, D_MODEL)."""
+    """Broadcast final modulation from (TILE, 640) row 0 to mu/sigma (SEQ_PADDED, D_MODEL).
+    broadcast(dims=[0]) replicates row 0 within each tile to all 32 rows."""
     grid_cols, _ = ttl.grid_size(dims=2)
     total_blocks = 2 * FMOD_BLOCKS_PER_MOD  # 12
     tiles_per_core = -(-total_blocks // grid_cols)
     src_dfb = ttl.make_dataflow_buffer_like(src, shape=(1, MOD_GRAN), buffer_factor=2)
-    sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
-    red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, MOD_GRAN), buffer_factor=2)
     bcast_dfb = ttl.make_dataflow_buffer_like(mu_out, shape=(1, MOD_GRAN), buffer_factor=2)
     out_dfb = ttl.make_dataflow_buffer_like(mu_out, shape=(1, MOD_GRAN), buffer_factor=2)
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
-        with sc_dfb.wait() as sc:
-            for local_t in range(tiles_per_core):
-                t = core_x * tiles_per_core + local_t
-                if t < total_blocks:
-                    with src_dfb.wait() as sv:
-                        with red_dfb.reserve() as rd:
-                            rd.store(ttl.math.reduce_sum(sv, sc, dims=[0]))
-                    with red_dfb.wait() as rdv, bcast_dfb.reserve() as bc:
-                        bc.store(ttl.math.broadcast(rdv, dims=[0]))
-                    with bcast_dfb.wait() as bcv, out_dfb.reserve() as o:
-                        o.store(bcv)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_blocks:
+                with src_dfb.wait() as sv, bcast_dfb.reserve() as bc:
+                    bc.store(ttl.math.broadcast(sv, dims=[0]))
+                with bcast_dfb.wait() as bcv, out_dfb.reserve() as o:
+                    o.store(bcv)
     @ttl.datamovement()
     def dm_read():
         core_x, _ = ttl.core(dims=2)
-        with sc_dfb.reserve() as blk:
-            tx = ttl.copy(scaler[0, 0], blk); tx.wait()
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_blocks:
@@ -940,16 +927,18 @@ def build_rope_tables(state, offset, tt_device):
         p = f"blocks.{i}"
         sins = state[f"{p}.selfattn.rope.sins"]  # (1, max_pos, N_HEADS, D_HEAD)
         coss = state[f"{p}.selfattn.rope.coss"]
-        # Build (HEAD_BATCH, D_HEAD_PAD) = (N_HEADS * SEQ_PADDED, 32)
+        n_rope_heads = sins.shape[2]  # 1 if shared, N_HEADS if per-head
+        # Vectorized: gather positions offset..offset+SEQ-1 for all heads at once
+        pos_indices = torch.arange(offset, offset + SEQ)
+        # (SEQ, n_rope_heads, D_HEAD) -> clamp head index for broadcast
+        sin_slice = sins[0, pos_indices, :, :]  # (SEQ, n_rope_heads, D_HEAD)
+        cos_slice = coss[0, pos_indices, :, :]
         sin_2d = torch.zeros(HEAD_BATCH, D_HEAD_PAD, dtype=torch.bfloat16)
         cos_2d = torch.zeros(HEAD_BATCH, D_HEAD_PAD, dtype=torch.bfloat16)
-        n_rope_heads = sins.shape[2]  # 1 if shared, N_HEADS if per-head
         for h in range(N_HEADS):
             rh = min(h, n_rope_heads - 1)
-            for s in range(SEQ):
-                pos = offset + s
-                sin_2d[h * SEQ_PADDED + s, :D_HEAD] = sins[0, pos, rh, :]
-                cos_2d[h * SEQ_PADDED + s, :D_HEAD] = coss[0, pos, rh, :]
+            sin_2d[h * SEQ_PADDED:h * SEQ_PADDED + SEQ, :D_HEAD] = sin_slice[:, rh, :]
+            cos_2d[h * SEQ_PADDED:h * SEQ_PADDED + SEQ, :D_HEAD] = cos_slice[:, rh, :]
         tables[i] = (to_tt(sin_2d, tt_device), to_tt(cos_2d, tt_device))
     return tables
 
@@ -1103,9 +1092,8 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
     def tnow(): return time.time()
 
     t0 = tnow()
-    # Conditioning: all inputs already on device (no to_tt calls)
-    linear_k10(time_pe_tt, dev['mixer_w'], scr['cond_a'])
-    add_kernel(scr['cond_a'], dev['mixer_bias'], scr['cond_b'])
+    # Conditioning: fused linear+bias, then add action + silu
+    linear_bias_k10(time_pe_tt, dev['mixer_w'], dev['mixer_bias'], scr['cond_b'])
     add_kernel(scr['cond_b'], action_tt, scr['cond_a'])
     silu_kernel(scr['cond_a'], scr['cond_silu'])
     timers['conditioning'] = tnow() - t0
@@ -1133,22 +1121,14 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
     for block_idx in range(N_BLOCKS):
         p = f"blocks.{block_idx}"
 
-        # TODO: re-enable mod_broadcast_all once debugged (~8ms -> ~3.6ms).
-        # Device-side version:
-        #   linear_k10(scr['cond_silu'], dev[f'{p}.mod_w'], scr['mod_a'])
-        #   mod_broadcast_all(scr['mod_a'],
-        #       dev[f'{p}.mod_bias_mu1'], ..., dev[f'{p}.mod_bias_c2'],
-        #       scaler_tt, scr['mu1'], ..., scr['c2'])
-        # The kernel reads src row 0 via reduce_sum(dims=[0]) + broadcast(dims=[0])
-        # but produces wrong values. Needs investigation.
         t0 = tnow()
         linear_k10(scr['cond_silu'], dev[f'{p}.mod_w'], scr['mod_a'])
-        mod_h = ttnn.to_torch(scr['mod_a'])
-        mod_h[0] = mod_h[0] + state[f"{p}.modulation.1.bias"]
-        chunks = mod_h[0, :D_MODEL*6].reshape(6, D_MODEL)
-        for ci, buf in enumerate(['mu1', 'sigma1', 'c1', 'mu2', 'sigma2', 'c2']):
-            expanded = chunks[ci].unsqueeze(0).expand(SEQ_PADDED, -1).contiguous()
-            scr[buf] = to_tt(expanded, tt_device)
+        mod_broadcast_all(scr['mod_a'],
+            dev[f'{p}.mod_bias_mu1'], dev[f'{p}.mod_bias_sigma1'],
+            dev[f'{p}.mod_bias_c1'], dev[f'{p}.mod_bias_mu2'],
+            dev[f'{p}.mod_bias_sigma2'], dev[f'{p}.mod_bias_c2'],
+            scaler_tt, scr['mu1'], scr['sigma1'], scr['c1'],
+            scr['mu2'], scr['sigma2'], scr['c2'])
         block_timers['modulation'] += tnow() - t0
 
         t0 = tnow()
@@ -1193,10 +1173,10 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         else:
             k_full = k_new
             v_full = v_new
-            # Scratch buffers get reused across blocks; save to host for persistence
+            # Scratch buffers get reused across blocks; clone on device for persistence
             new_device_kv.append({
-                'k_host': ttnn.to_torch(k_new),
-                'v_host': ttnn.to_torch(v_new),
+                'k': ttnn.clone(k_new, memory_config=ttnn.DRAM_MEMORY_CONFIG),
+                'v': ttnn.clone(v_new, memory_config=ttnn.DRAM_MEMORY_CONFIG),
             })
         t_kv_cache = tnow() - t1
 
@@ -1242,21 +1222,15 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         z_cur, z_next = z_next, z_cur
         block_timers['gated_res2'] += tnow() - t0
 
-    # TODO: re-enable final_mod_broadcast once debugged. Device-side version:
-    #   final_mod_broadcast(scr['fm_b'], scaler_tt, scr['mu_f'], scr['sig_f'])
-    # Same reduce_sum/broadcast bug as mod_broadcast_all.
     t0 = tnow()
     linear_k10(scr['cond_silu'], dev['final_mod_w'], scr['fm_a'])
     add_kernel(scr['fm_a'], dev['final_mod_bias'], scr['fm_b'])
-    fm_h = ttnn.to_torch(scr['fm_b'])
-    mu_f, sigma_f = fm_h[0, :640].reshape(2, D_MODEL).chunk(2, dim=0)
+    final_mod_broadcast(scr['fm_b'], scaler_tt, scr['mu_f'], scr['sig_f'])
 
     rmsnorm_d320(z_cur, scaler_tt, mean_scale_tt, scr['d320_a'])
     mul_kernel(scr['d320_a'], dev['final_norm_w'], scr['d320_b'])
 
-    mu_fe = to_tt(expand_per_frame(mu_f, TOKS_PER_FRAME, SEQ_PADDED), tt_device)
-    sig_fe = to_tt(expand_per_frame(sigma_f, TOKS_PER_FRAME, SEQ_PADDED), tt_device)
-    adaln_modulate_kernel(scr['d320_b'], mu_fe, sig_fe, scr['d320_a'])
+    adaln_modulate_kernel(scr['d320_b'], scr['mu_f'], scr['sig_f'], scr['d320_a'])
     timers['final_mod'] = tnow() - t0
 
     t0 = tnow()
@@ -1265,12 +1239,7 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
     out = unpatch_forward(z_no_reg, state)
     timers['unpatch'] = tnow() - t0
 
-    # First frame: convert host tensors back to device for cache persistence
-    if first_frame:
-        new_device_kv = [
-            {'k': to_tt(e['k_host'], tt_device), 'v': to_tt(e['v_host'], tt_device)}
-            for e in new_device_kv
-        ]
+    # KV cache is already on device (either from clone on first frame or concat on subsequent)
 
     total = sum(timers.values()) + sum(block_timers.values())
     print(f"  dit_forward total: {total*1000:.0f}ms")
