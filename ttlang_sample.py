@@ -1224,14 +1224,11 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         block_timers['gated_res2'] += tnow() - t0
 
     t0 = tnow()
-    linear_k10(scr['cond_silu'], dev['final_mod_w'], scr['fm_a'])
-    add_kernel(scr['fm_a'], dev['final_mod_bias'], scr['fm_b'])
+    # Fuse: linear+bias (was linear+add), then broadcast, then fused norm+mod (was rmsnorm+mul+adaln)
+    linear_bias_k10(scr['cond_silu'], dev['final_mod_w'], dev['final_mod_bias'], scr['fm_b'])
     final_mod_broadcast(scr['fm_b'], scaler_tt, scr['mu_f'], scr['sig_f'])
-
-    rmsnorm_d320(z_cur, scaler_tt, mean_scale_tt, scr['d320_a'])
-    mul_kernel(scr['d320_a'], dev['final_norm_w'], scr['d320_b'])
-
-    adaln_modulate_kernel(scr['d320_b'], scr['mu_f'], scr['sig_f'], scr['d320_a'])
+    fused_norm_mod_d320(z_cur, dev['final_norm_w'], scr['mu_f'], scr['sig_f'],
+                        scaler_tt, mean_scale_tt, scr['d320_a'])
     timers['final_mod'] = tnow() - t0
 
     t0 = tnow()
