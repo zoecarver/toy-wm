@@ -514,73 +514,107 @@ linear_k40 = make_linear_kernel(40)
 linear_bias_k10 = make_fused_linear_bias_kernel(10)
 linear_bias_k40 = make_fused_linear_bias_kernel(40)
 
-# Modulation broadcast kernels: read column chunks from (TILE, 1920) and broadcast to (SEQ_PADDED, D_MODEL)
+# Fused modulation broadcast: all 6 params (mu1,sig1,c1,mu2,sig2,c2) in one kernel.
+# 6 separate kernels → 1 kernel, saving 5 launch overheads per block.
+N_MODS = 6
 MOD_D_TILES = D_MODEL // TILE  # 10
-MOD_GRAN = 5  # column tiles per block (must divide MOD_D_TILES)
+MOD_GRAN = 5
 MOD_COL_BLOCKS = MOD_D_TILES // MOD_GRAN  # 2
+MOD_SEQ_TILES = SEQ_PADDED // TILE  # 3
+MOD_BLOCKS_PER_MOD = MOD_SEQ_TILES * MOD_COL_BLOCKS  # 6
 
-def make_mod_broadcast_kernel(col_offset_tiles):
-    """Broadcast + bias fused: read column slice from linear output row 0,
-    broadcast to all rows, add bias, write to output. One kernel per chunk."""
-    @ttl.kernel(grid="auto")
-    def mod_broadcast(src, bias, scaler, out):
-        grid_cols, _ = ttl.grid_size(dims=2)
-        seq_tiles = SEQ_PADDED // TILE
-        total_blocks = seq_tiles * MOD_COL_BLOCKS
-        tiles_per_core = -(-total_blocks // grid_cols)
-        src_dfb = ttl.make_dataflow_buffer_like(src, shape=(1, MOD_GRAN), buffer_factor=2)
-        bias_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, MOD_GRAN), buffer_factor=2)
-        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
-        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, MOD_GRAN), buffer_factor=2)
-        bcast_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, MOD_GRAN), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, MOD_GRAN), buffer_factor=2)
-        @ttl.compute()
-        def compute():
-            core_x, _ = ttl.core(dims=2)
-            with sc_dfb.wait() as sc:
-                for local_t in range(tiles_per_core):
-                    t = core_x * tiles_per_core + local_t
-                    if t < total_blocks:
-                        with src_dfb.wait() as sv:
-                            with red_dfb.reserve() as rd:
-                                rd.store(ttl.math.reduce_sum(sv, sc, dims=[0]))
-                        with red_dfb.wait() as rdv, bcast_dfb.reserve() as bc:
-                            bc.store(ttl.math.broadcast(rdv, dims=[0]))
-                        with bcast_dfb.wait() as bcv, bias_dfb.wait() as bv, out_dfb.reserve() as o:
-                            o.store(bcv + bv)
-        @ttl.datamovement()
-        def dm_read():
-            core_x, _ = ttl.core(dims=2)
-            with sc_dfb.reserve() as blk:
-                tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+@ttl.kernel(grid="auto")
+def mod_broadcast_all(src, b1, b2, b3, b4, b5, b6, scaler, o1, o2, o3, o4, o5, o6):
+    """Broadcast all 6 modulation params from linear output row 0 + bias in one kernel."""
+    grid_cols, _ = ttl.grid_size(dims=2)
+    total_blocks = N_MODS * MOD_BLOCKS_PER_MOD  # 6 * 6 = 36
+    tiles_per_core = -(-total_blocks // grid_cols)
+    src_dfb = ttl.make_dataflow_buffer_like(src, shape=(1, MOD_GRAN), buffer_factor=2)
+    bias_dfb = ttl.make_dataflow_buffer_like(b1, shape=(1, MOD_GRAN), buffer_factor=2)
+    sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+    red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, MOD_GRAN), buffer_factor=2)
+    bcast_dfb = ttl.make_dataflow_buffer_like(o1, shape=(1, MOD_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(o1, shape=(1, MOD_GRAN), buffer_factor=2)
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.core(dims=2)
+        with sc_dfb.wait() as sc:
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
                 if t < total_blocks:
-                    cb = t % MOD_COL_BLOCKS
-                    row = t // MOD_COL_BLOCKS
-                    sc_start = col_offset_tiles + cb * MOD_GRAN
-                    with src_dfb.reserve() as blk:
-                        tx = ttl.copy(src[0, sc_start:sc_start + MOD_GRAN], blk); tx.wait()
+                    with src_dfb.wait() as sv:
+                        with red_dfb.reserve() as rd:
+                            rd.store(ttl.math.reduce_sum(sv, sc, dims=[0]))
+                    with red_dfb.wait() as rdv, bcast_dfb.reserve() as bc:
+                        bc.store(ttl.math.broadcast(rdv, dims=[0]))
+                    with bcast_dfb.wait() as bcv, bias_dfb.wait() as bv, out_dfb.reserve() as o:
+                        o.store(bcv + bv)
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.core(dims=2)
+        with sc_dfb.reserve() as blk:
+            tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_blocks:
+                mod_idx = t // MOD_BLOCKS_PER_MOD
+                rem = t % MOD_BLOCKS_PER_MOD
+                row = rem // MOD_COL_BLOCKS
+                cb = rem % MOD_COL_BLOCKS
+                src_col = mod_idx * MOD_D_TILES + cb * MOD_GRAN
+                bc = cb * MOD_GRAN
+                ec = bc + MOD_GRAN
+                with src_dfb.reserve() as blk:
+                    tx = ttl.copy(src[0, src_col:src_col + MOD_GRAN], blk); tx.wait()
+                # Select bias tensor by mod_idx
+                if mod_idx == 0:
                     with bias_dfb.reserve() as blk:
-                        tx = ttl.copy(bias[row, cb * MOD_GRAN:(cb + 1) * MOD_GRAN], blk); tx.wait()
-        @ttl.datamovement()
-        def dm_write():
-            core_x, _ = ttl.core(dims=2)
-            for local_t in range(tiles_per_core):
-                t = core_x * tiles_per_core + local_t
-                if t < total_blocks:
-                    cb = t % MOD_COL_BLOCKS
-                    row = t // MOD_COL_BLOCKS
+                        tx = ttl.copy(b1[row, bc:ec], blk); tx.wait()
+                if mod_idx == 1:
+                    with bias_dfb.reserve() as blk:
+                        tx = ttl.copy(b2[row, bc:ec], blk); tx.wait()
+                if mod_idx == 2:
+                    with bias_dfb.reserve() as blk:
+                        tx = ttl.copy(b3[row, bc:ec], blk); tx.wait()
+                if mod_idx == 3:
+                    with bias_dfb.reserve() as blk:
+                        tx = ttl.copy(b4[row, bc:ec], blk); tx.wait()
+                if mod_idx == 4:
+                    with bias_dfb.reserve() as blk:
+                        tx = ttl.copy(b5[row, bc:ec], blk); tx.wait()
+                if mod_idx == 5:
+                    with bias_dfb.reserve() as blk:
+                        tx = ttl.copy(b6[row, bc:ec], blk); tx.wait()
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_blocks:
+                mod_idx = t // MOD_BLOCKS_PER_MOD
+                rem = t % MOD_BLOCKS_PER_MOD
+                row = rem // MOD_COL_BLOCKS
+                cb = rem % MOD_COL_BLOCKS
+                bc = cb * MOD_GRAN
+                ec = bc + MOD_GRAN
+                if mod_idx == 0:
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[row, cb * MOD_GRAN:(cb + 1) * MOD_GRAN]); tx.wait()
-    return mod_broadcast
-
-broadcast_mu1 = make_mod_broadcast_kernel(0)
-broadcast_sigma1 = make_mod_broadcast_kernel(10)
-broadcast_c1 = make_mod_broadcast_kernel(20)
-broadcast_mu2 = make_mod_broadcast_kernel(30)
-broadcast_sigma2 = make_mod_broadcast_kernel(40)
-broadcast_c2 = make_mod_broadcast_kernel(50)
+                        tx = ttl.copy(blk, o1[row, bc:ec]); tx.wait()
+                if mod_idx == 1:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, o2[row, bc:ec]); tx.wait()
+                if mod_idx == 2:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, o3[row, bc:ec]); tx.wait()
+                if mod_idx == 3:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, o4[row, bc:ec]); tx.wait()
+                if mod_idx == 4:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, o5[row, bc:ec]); tx.wait()
+                if mod_idx == 5:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, o6[row, bc:ec]); tx.wait()
 
 # ============================================================
 # Host helpers
@@ -799,16 +833,14 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
     for block_idx in range(N_BLOCKS):
         p = f"blocks.{block_idx}"
 
-        # Modulation: all on device, no host roundtrip
+        # Modulation: linear + fused 6-in-1 broadcast (7 calls → 2)
         t0 = tnow()
         linear_k10(scr['cond_silu'], dev[f'{p}.mod_w'], scr['mod_a'])
-        # 6 fused broadcast+bias kernels (read linear output, broadcast row 0, add bias)
-        broadcast_mu1(scr['mod_a'], dev[f'{p}.mod_bias_mu1'], scaler_tt, scr['mu1'])
-        broadcast_sigma1(scr['mod_a'], dev[f'{p}.mod_bias_sigma1'], scaler_tt, scr['sigma1'])
-        broadcast_c1(scr['mod_a'], dev[f'{p}.mod_bias_c1'], scaler_tt, scr['c1'])
-        broadcast_mu2(scr['mod_a'], dev[f'{p}.mod_bias_mu2'], scaler_tt, scr['mu2'])
-        broadcast_sigma2(scr['mod_a'], dev[f'{p}.mod_bias_sigma2'], scaler_tt, scr['sigma2'])
-        broadcast_c2(scr['mod_a'], dev[f'{p}.mod_bias_c2'], scaler_tt, scr['c2'])
+        mod_broadcast_all(scr['mod_a'],
+            dev[f'{p}.mod_bias_mu1'], dev[f'{p}.mod_bias_sigma1'], dev[f'{p}.mod_bias_c1'],
+            dev[f'{p}.mod_bias_mu2'], dev[f'{p}.mod_bias_sigma2'], dev[f'{p}.mod_bias_c2'],
+            scaler_tt,
+            scr['mu1'], scr['sigma1'], scr['c1'], scr['mu2'], scr['sigma2'], scr['c2'])
         block_timers['modulation'] += tnow() - t0
 
         # Fused RMSNorm1 + weight mul + adaln modulate (3 kernels → 1)
