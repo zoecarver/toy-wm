@@ -17,6 +17,7 @@ D_MODEL = 320
 D_MID = 1280
 N_HEADS = 20
 D_HEAD = 16
+D_HEAD_PAD = 32  # D_HEAD padded to tile size
 N_BLOCKS = 8
 PATCH_SIZE = 3
 HEIGHT = 24
@@ -25,6 +26,10 @@ TOKS_PER_FRAME = (HEIGHT // PATCH_SIZE) * (WIDTH // PATCH_SIZE) + 1  # 65
 T_MAX = 1000
 SEQ = TOKS_PER_FRAME  # 65
 SEQ_PADDED = ((SEQ + TILE - 1) // TILE) * TILE  # 96
+N_WINDOW = 30
+MAX_KV_SEQ = (N_WINDOW - 1) * TOKS_PER_FRAME + SEQ  # 1950
+MAX_KV_PADDED = ((MAX_KV_SEQ + TILE - 1) // TILE) * TILE  # 1952
+HEAD_BATCH = N_HEADS * SEQ_PADDED  # 1920 = 60 tiles
 
 # ============================================================
 # TT-Lang Kernels (same as before)
@@ -507,11 +512,65 @@ def make_fused_linear_bias_kernel(k_chunk):
                         tx = ttl.copy(blk, out[row, col]); tx.wait()
     return linear_bias_kernel
 
+@ttl.kernel(grid="auto")
+def rope_kernel(x, sin_table, cos_table, perm_matrix, out):
+    """RoPE via permutation matrix: out = cos*x + sin*(x @ P).
+    x, sin_table, cos_table: (N, 1) tiles. perm_matrix: (1, 1) tile.
+    Reads x twice: once for matmul, once for elementwise."""
+    grid_cols, _ = ttl.grid_size(dims=2)
+    n_rows = x.shape[0] // TILE
+    tiles_per_core = -(-n_rows // grid_cols)
+    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+    sin_dfb = ttl.make_dataflow_buffer_like(sin_table, shape=(1, 1), buffer_factor=2)
+    cos_dfb = ttl.make_dataflow_buffer_like(cos_table, shape=(1, 1), buffer_factor=2)
+    p_dfb = ttl.make_dataflow_buffer_like(perm_matrix, shape=(1, 1), buffer_factor=1)
+    perm_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.core(dims=2)
+        with p_dfb.wait() as p:
+            for local_t in range(tiles_per_core):
+                t = core_x * tiles_per_core + local_t
+                if t < n_rows:
+                    with x_dfb.wait() as xv, perm_dfb.reserve() as perm:
+                        perm.store(xv @ p)
+                    with x_dfb.wait() as xv2, perm_dfb.wait() as pv, sin_dfb.wait() as sv, cos_dfb.wait() as cv, out_dfb.reserve() as o:
+                        o.store(cv * xv2 + sv * pv)
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.core(dims=2)
+        with p_dfb.reserve() as blk:
+            tx = ttl.copy(perm_matrix[0, 0], blk); tx.wait()
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < n_rows:
+                # x read 1 (for matmul)
+                with x_dfb.reserve() as blk:
+                    tx = ttl.copy(x[t, 0], blk); tx.wait()
+                # x read 2 (for elementwise) + sin + cos
+                with x_dfb.reserve() as blk:
+                    tx = ttl.copy(x[t, 0], blk); tx.wait()
+                with sin_dfb.reserve() as blk:
+                    tx = ttl.copy(sin_table[t, 0], blk); tx.wait()
+                with cos_dfb.reserve() as blk:
+                    tx = ttl.copy(cos_table[t, 0], blk); tx.wait()
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < n_rows:
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[t, 0]); tx.wait()
+
 rmsnorm_d320 = make_rmsnorm_kernel(D_MODEL // TILE)
+rmsnorm_d1 = make_rmsnorm_kernel(1)  # for QK-norm over D_HEAD_PAD=32 (1 tile)
 fused_norm_mod_d320 = make_fused_norm_mod_kernel(D_MODEL // TILE)
 linear_k10 = make_linear_kernel(10)
 linear_k40 = make_linear_kernel(40)
 linear_bias_k10 = make_fused_linear_bias_kernel(10)
+linear_bias_k20 = make_fused_linear_bias_kernel(20)  # for O proj with padded input (640/32=20)
 linear_bias_k40 = make_fused_linear_bias_kernel(40)
 
 # Fused modulation broadcast: all 6 params (mu1,sig1,c1,mu2,sig2,c2) in one kernel.
@@ -678,6 +737,28 @@ def apply_rope(x, sins, coss):
     x_perm[:, :, :, odd] = x[:, :, :, even]
     return (coss * x.float() + sins * x_perm.float()).to(x.dtype)
 
+def build_rope_tables(state, offset, tt_device):
+    """Build sin/cos tables in head-batched 2D format for device-side RoPE.
+    Returns dict of device tensors: {block_idx: (sin_tt, cos_tt)}.
+    Each is (HEAD_BATCH, D_HEAD_PAD) = (1920, 32)."""
+    tables = {}
+    for i in range(N_BLOCKS):
+        p = f"blocks.{i}"
+        sins = state[f"{p}.selfattn.rope.sins"]  # (1, max_pos, N_HEADS, D_HEAD)
+        coss = state[f"{p}.selfattn.rope.coss"]
+        # Build (HEAD_BATCH, D_HEAD_PAD) = (N_HEADS * SEQ_PADDED, 32)
+        sin_2d = torch.zeros(HEAD_BATCH, D_HEAD_PAD, dtype=torch.bfloat16)
+        cos_2d = torch.zeros(HEAD_BATCH, D_HEAD_PAD, dtype=torch.bfloat16)
+        n_rope_heads = sins.shape[2]  # 1 if shared, N_HEADS if per-head
+        for h in range(N_HEADS):
+            rh = min(h, n_rope_heads - 1)
+            for s in range(SEQ):
+                pos = offset + s
+                sin_2d[h * SEQ_PADDED + s, :D_HEAD] = sins[0, pos, rh, :]
+                cos_2d[h * SEQ_PADDED + s, :D_HEAD] = coss[0, pos, rh, :]
+        tables[i] = (to_tt(sin_2d, tt_device), to_tt(cos_2d, tt_device))
+    return tables
+
 
 # ============================================================
 # Weight preloading: send everything to device ONCE
@@ -710,13 +791,33 @@ def preload_weights(state, tt_device):
         dev[f'{p}.norm2_w'] = to_tt(
             state[f"{p}.norm2.w"].unsqueeze(0).expand(SEQ_PADDED, -1).contiguous(), tt_device)
 
-        # QKV
-        dev[f'{p}.qkv_w'] = to_tt(state[f"{p}.selfattn.QKV.weight"].T.contiguous(), tt_device)
-        dev[f'{p}.qkv_bias'] = to_tt(expand_bias(state[f"{p}.selfattn.QKV.bias"], SEQ_PADDED), tt_device)
+        # QKV with D_HEAD padded to D_HEAD_PAD=32 (tile-aligned per head)
+        qkv_w_orig = state[f"{p}.selfattn.QKV.weight"].T.contiguous()  # (D_MODEL, 3*N_HEADS*D_HEAD)
+        qkv_w_pad = torch.zeros(D_MODEL, 3 * N_HEADS * D_HEAD_PAD, dtype=torch.bfloat16)
+        for h in range(3 * N_HEADS):
+            qkv_w_pad[:, h*D_HEAD_PAD:h*D_HEAD_PAD+D_HEAD] = qkv_w_orig[:, h*D_HEAD:h*D_HEAD+D_HEAD]
+        dev[f'{p}.qkv_w'] = to_tt(qkv_w_pad, tt_device)
+        qkv_bias_orig = state[f"{p}.selfattn.QKV.bias"]
+        qkv_bias_pad = torch.zeros(3 * N_HEADS * D_HEAD_PAD, dtype=torch.bfloat16)
+        for h in range(3 * N_HEADS):
+            qkv_bias_pad[h*D_HEAD_PAD:h*D_HEAD_PAD+D_HEAD] = qkv_bias_orig[h*D_HEAD:h*D_HEAD+D_HEAD]
+        dev[f'{p}.qkv_bias'] = to_tt(expand_bias(qkv_bias_pad, SEQ_PADDED), tt_device)
 
-        # O projection
-        dev[f'{p}.o_w'] = to_tt(state[f"{p}.selfattn.O.weight"].T.contiguous(), tt_device)
+        # O projection with padded input: (N_HEADS*D_HEAD_PAD, D_MODEL) = (640, 320)
+        o_w_orig = state[f"{p}.selfattn.O.weight"].T.contiguous()  # (D_MODEL, D_MODEL) = (320, 320)
+        o_w_pad = torch.zeros(N_HEADS * D_HEAD_PAD, D_MODEL, dtype=torch.bfloat16)
+        for h in range(N_HEADS):
+            o_w_pad[h*D_HEAD_PAD:h*D_HEAD_PAD+D_HEAD, :] = o_w_orig[h*D_HEAD:h*D_HEAD+D_HEAD, :]
+        dev[f'{p}.o_w'] = to_tt(o_w_pad, tt_device)
         dev[f'{p}.o_bias'] = to_tt(expand_bias(state[f"{p}.selfattn.O.bias"], SEQ_PADDED), tt_device)
+
+        # QK-norm weights: (D_HEAD,) padded to (D_HEAD_PAD,), expanded to (HEAD_BATCH, D_HEAD_PAD)
+        for qk, name in [('lnq', 'lnq_w'), ('lnk', 'lnk_w')]:
+            w = state[f"{p}.selfattn.{qk}.w"]  # (D_HEAD,)
+            w_pad = torch.zeros(D_HEAD_PAD, dtype=torch.bfloat16)
+            w_pad[:D_HEAD] = w
+            dev[f'{p}.{name}'] = to_tt(
+                w_pad.unsqueeze(0).expand(HEAD_BATCH, -1).contiguous(), tt_device)
 
         # GEGLU
         dev[f'{p}.geglu_up_w'] = to_tt(state[f"{p}.geglu.up_proj.weight"].T.contiguous(), tt_device)
@@ -726,14 +827,20 @@ def preload_weights(state, tt_device):
         dev[f'{p}.geglu_down_w'] = to_tt(state[f"{p}.geglu.down.weight"].T.contiguous(), tt_device)
         dev[f'{p}.geglu_down_bias'] = to_tt(expand_bias(state[f"{p}.geglu.down.bias"], SEQ_PADDED), tt_device)
 
-        # QK-norm weights (keep on host for now, used in rmsnorm_host)
-        # RoPE sin/cos tables (keep on host for now, used in apply_rope)
-
     # Final modulation + norm
     dev['final_mod_w'] = to_tt(state["modulation.1.weight"].T.contiguous(), tt_device)
     dev['final_mod_bias'] = to_tt(expand_bias(state["modulation.1.bias"], TILE), tt_device)
     dev['final_norm_w'] = to_tt(
         state["norm.w"].unsqueeze(0).expand(SEQ_PADDED, -1).contiguous(), tt_device)
+
+    # RoPE permutation matrix: (32, 32) that does even/odd swap with negation
+    # P[2i+1, 2i] = -1 (put -x[odd] at even position)
+    # P[2i, 2i+1] = 1 (put x[even] at odd position)
+    P = torch.zeros(D_HEAD_PAD, D_HEAD_PAD, dtype=torch.bfloat16)
+    for i in range(D_HEAD // 2):
+        P[2*i+1, 2*i] = -1.0
+        P[2*i, 2*i+1] = 1.0
+    dev['rope_perm'] = to_tt(P, tt_device)
 
     elapsed = time.time() - t0
     print(f"Preloaded {len(dev)} tensors to device in {elapsed:.1f}s")
@@ -751,9 +858,12 @@ def prealloc_scratch(tt_device):
     s['d320_a'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
     s['d320_b'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
     s['d320_c'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
-    # (SEQ_PADDED, 960) scratch for QKV
-    s['d960_a'] = zeros_tt((SEQ_PADDED, 960), tt_device)
-    s['d960_b'] = zeros_tt((SEQ_PADDED, 960), tt_device)
+    # QKV with padded heads: (SEQ_PADDED, 3*N_HEADS*D_HEAD_PAD) = (96, 1920)
+    s['qkv_out'] = zeros_tt((SEQ_PADDED, 3 * N_HEADS * D_HEAD_PAD), tt_device)
+    # Head-batched format: (N_HEADS*SEQ_PADDED, D_HEAD_PAD) = (1920, 32)
+    s['hb_a'] = zeros_tt((HEAD_BATCH, D_HEAD_PAD), tt_device)
+    s['hb_b'] = zeros_tt((HEAD_BATCH, D_HEAD_PAD), tt_device)
+    s['hb_c'] = zeros_tt((HEAD_BATCH, D_HEAD_PAD), tt_device)
     # (SEQ_PADDED, D_MID) scratch for GEGLU - need 3 (u_b + g_a alive for mul)
     s['d1280_a'] = zeros_tt((SEQ_PADDED, D_MID), tt_device)
     s['d1280_b'] = zeros_tt((SEQ_PADDED, D_MID), tt_device)
@@ -778,6 +888,7 @@ def prealloc_scratch(tt_device):
     # Final modulation broadcast
     s['mu_f'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
     s['sig_f'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
+    # KV cache managed dynamically via ttnn.concat (not pre-allocated)
     elapsed = time.time() - t0
     print(f"Pre-allocated {len(s)} scratch tensors in {elapsed:.1f}s")
     return s
@@ -788,7 +899,7 @@ def prealloc_scratch(tt_device):
 # ============================================================
 
 def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-                kv_cache=None, frame_idx=0):
+                mean_scale_16_tt, rope_tables, kv_cache=None, frame_idx=0):
     timers = {}
     def tnow(): return time.time()
 
@@ -849,61 +960,67 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
                             scaler_tt, mean_scale_tt, scr['d320_a'])
         block_timers['norm1_mod'] += tnow() - t0
 
-        # Fused QKV projection + bias (2 kernels → 1)
+        # QKV projection with padded heads → (SEQ_PADDED, 1920) on device
         t0 = tnow()
-        linear_bias_k10(scr['d320_a'], dev[f'{p}.qkv_w'], dev[f'{p}.qkv_bias'], scr['d960_b'])
+        linear_bias_k10(scr['d320_a'], dev[f'{p}.qkv_w'], dev[f'{p}.qkv_bias'], scr['qkv_out'])
         block_timers['qkv_proj'] += tnow() - t0
 
-        # Host: QKV reshape, QK-norm, RoPE, pad, KV cache
+        # Device-side attention: split → reshape → QK-norm → RoPE → KV cache → SDPA → O proj
         t0 = tnow()
-        qkv_h = ttnn.to_torch(scr['d960_b'])[:SEQ]
-        q_h, k_h, v_h = qkv_h.chunk(3, dim=-1)
-        q_heads = q_h.reshape(1, SEQ, N_HEADS, D_HEAD)
-        k_heads = k_h.reshape(1, SEQ, N_HEADS, D_HEAD)
-        v_heads = v_h.reshape(1, SEQ, N_HEADS, D_HEAD)
 
-        new_kv.append({'k': k_heads, 'v': v_heads})
+        # Split Q/K/V: (96, 1920) → 3 × (96, 640) → reshape+permute to head-batched (1920, 32)
+        qkv_3d = ttnn.reshape(scr['qkv_out'], [3, SEQ_PADDED, N_HEADS * D_HEAD_PAD])
 
+        q_flat = ttnn.slice(qkv_3d, [0, 0, 0], [1, SEQ_PADDED, N_HEADS * D_HEAD_PAD])
+        q_3d = ttnn.reshape(q_flat, [SEQ_PADDED, N_HEADS, D_HEAD_PAD])
+        q_hm = ttnn.permute(q_3d, [1, 0, 2])
+        q_hb = ttnn.reshape(q_hm, [HEAD_BATCH, D_HEAD_PAD])
+
+        k_flat = ttnn.slice(qkv_3d, [1, 0, 0], [2, SEQ_PADDED, N_HEADS * D_HEAD_PAD])
+        k_3d = ttnn.reshape(k_flat, [SEQ_PADDED, N_HEADS, D_HEAD_PAD])
+        k_hm = ttnn.permute(k_3d, [1, 0, 2])
+        k_hb = ttnn.reshape(k_hm, [HEAD_BATCH, D_HEAD_PAD])
+
+        v_flat = ttnn.slice(qkv_3d, [2, 0, 0], [3, SEQ_PADDED, N_HEADS * D_HEAD_PAD])
+        v_3d = ttnn.reshape(v_flat, [SEQ_PADDED, N_HEADS, D_HEAD_PAD])
+        v_hm = ttnn.permute(v_3d, [1, 0, 2])
+        v_sdpa = ttnn.reshape(v_hm, [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
+
+        # Q: rmsnorm → weight mul → RoPE (all on device, result in hb_c)
+        rmsnorm_d1(q_hb, scaler_tt, mean_scale_16_tt, scr['hb_a'])
+        mul_kernel(scr['hb_a'], dev[f'{p}.lnq_w'], scr['hb_b'])
+        rope_kernel(scr['hb_b'], rope_tables[block_idx][0], rope_tables[block_idx][1],
+                    dev['rope_perm'], scr['hb_c'])
+        q_sdpa = ttnn.reshape(scr['hb_c'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
+
+        # K: rmsnorm → weight mul → RoPE (result in hb_a)
+        rmsnorm_d1(k_hb, scaler_tt, mean_scale_16_tt, scr['hb_b'])
+        mul_kernel(scr['hb_b'], dev[f'{p}.lnk_w'], scr['hb_a'])
+        rope_kernel(scr['hb_a'], rope_tables[block_idx][0], rope_tables[block_idx][1],
+                    dev['rope_perm'], scr['hb_b'])
+        k_new_sdpa = ttnn.reshape(scr['hb_b'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
+
+        # KV cache: concat with previous frames' K/V (device tensors)
         if kv_cache is not None and kv_cache[block_idx] is not None:
-            cached_k_raw = kv_cache[block_idx]['k']
-            cached_v_raw = kv_cache[block_idx]['v']
-            k_all = torch.cat([cached_k_raw, k_heads], dim=1)
-            v_all = torch.cat([cached_v_raw, v_heads], dim=1)
-            offset = cached_k_raw.shape[1]
+            k_sdpa = ttnn.concat([kv_cache[block_idx]['k'], k_new_sdpa], dim=2)
+            v_full = ttnn.concat([kv_cache[block_idx]['v'], v_sdpa], dim=2)
         else:
-            k_all = k_heads
-            v_all = v_heads
-            offset = 0
+            k_sdpa = k_new_sdpa
+            v_full = v_sdpa
+        new_kv.append({'k': k_new_sdpa, 'v': v_sdpa})
 
-        q_n = rmsnorm_host(q_heads, state[f"{p}.selfattn.lnq.w"])
-        k_n = rmsnorm_host(k_all, state[f"{p}.selfattn.lnk.w"])
+        # SDPA on device (no transfers!)
+        attn_out_tt = ttnn.transformer.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_full, is_causal=False, scale=1.0)
 
-        sins = state[f"{p}.selfattn.rope.sins"]
-        coss = state[f"{p}.selfattn.rope.coss"]
-        total_kv_seq = k_all.shape[1]
-        q_r = apply_rope(q_n, sins[:, offset:offset+SEQ, :, :], coss[:, offset:offset+SEQ, :, :])
-        k_r = apply_rope(k_n, sins[:, :total_kv_seq, :, :], coss[:, :total_kv_seq, :, :])
-
-        kv_padded = ((total_kv_seq + TILE - 1) // TILE) * TILE
-        q_s = F.pad(F.pad(q_r.permute(0,2,1,3), (0,16)), (0,0,0,SEQ_PADDED-SEQ))
-        k_s = F.pad(F.pad(k_r.permute(0,2,1,3), (0,16)), (0,0,0,kv_padded-total_kv_seq))
-        v_s = F.pad(F.pad(v_all.permute(0,2,1,3), (0,16)), (0,0,0,kv_padded-total_kv_seq))
+        # Reshape output: (1, 20, 96, 32) → (96, 640) for O projection
+        attn_perm = ttnn.permute(attn_out_tt, [0, 2, 1, 3])
+        attn_2d = ttnn.reshape(attn_perm, [SEQ_PADDED, N_HEADS * D_HEAD_PAD])
         block_timers['host_attn'] += tnow() - t0
 
-        # SDPA
+        # O projection with padded weight: (96, 640) @ (640, 320) → (96, 320)
         t0 = tnow()
-        attn_out_tt = ttnn.transformer.scaled_dot_product_attention(
-            to_tt(q_s, tt_device), to_tt(k_s, tt_device), to_tt(v_s, tt_device),
-            is_causal=False, scale=1.0)
-        attn_h = ttnn.to_torch(attn_out_tt)[:, :, :SEQ, :D_HEAD]
-        attn_2d = attn_h.permute(0,2,1,3).reshape(SEQ, D_MODEL)
-        attn_p = torch.zeros(SEQ_PADDED, D_MODEL, dtype=torch.bfloat16)
-        attn_p[:SEQ] = attn_2d
-        block_timers['sdpa'] += tnow() - t0
-
-        # Fused O projection + bias (2 kernels → 1)
-        t0 = tnow()
-        linear_bias_k10(to_tt(attn_p, tt_device), dev[f'{p}.o_w'], dev[f'{p}.o_bias'], scr['d320_b'])
+        linear_bias_k20(attn_2d, dev[f'{p}.o_w'], dev[f'{p}.o_bias'], scr['d320_b'])
         block_timers['o_proj'] += tnow() - t0
 
         # Gated residual 1: z_next = z_cur + o_biased * c1
@@ -971,9 +1088,15 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
 
 
 def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-                 kv_cache=None, frame_idx=0):
+                 mean_scale_16_tt, kv_cache=None, frame_idx=0):
     ts = 1 - torch.linspace(0, 1, n_steps + 1)
     ts = 3 * ts / (2 * ts + 1)
+
+    # Build RoPE sin/cos tables for this frame's position offset (constant across denoise steps)
+    kv_offset = 0
+    if kv_cache is not None and kv_cache[0] is not None:
+        kv_offset = kv_cache[0]['k'].shape[2]  # dim 2 is seq in (1, N_HEADS, seq, D_HEAD_PAD)
+    rope_tables = build_rope_tables(state, kv_offset, tt_device)
 
     z = z_noise.clone()
     new_kv = None
@@ -983,12 +1106,12 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
 
         v_cond, new_kv = dit_forward(
             z, action_idx, t_val, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-            kv_cache=kv_cache, frame_idx=frame_idx)
+            mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
 
         if cfg > 0 and cfg != 1.0:
             v_uncond, _ = dit_forward(
                 z, 0, t_val, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-                kv_cache=kv_cache, frame_idx=frame_idx)
+                mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
             v_pred = v_uncond.float() + cfg * (v_cond.float() - v_uncond.float())
         else:
             v_pred = v_cond.float()
@@ -999,6 +1122,7 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
 
 
 def extend_kv_cache(kv_cache, new_kv, n_window):
+    """Extend KV cache with new K/V (device tensors). Concat along seq dim (dim=2)."""
     max_cached_frames = n_window - 1
     max_cached_seq = max_cached_frames * TOKS_PER_FRAME
 
@@ -1012,12 +1136,17 @@ def extend_kv_cache(kv_cache, new_kv, n_window):
         cur_k = new_kv[layer_idx]['k']
         cur_v = new_kv[layer_idx]['v']
 
-        full_k = torch.cat([old_k, cur_k], dim=1)
-        full_v = torch.cat([old_v, cur_v], dim=1)
+        full_k = ttnn.concat([old_k, cur_k], dim=2)
+        full_v = ttnn.concat([old_v, cur_v], dim=2)
 
-        if full_k.shape[1] > max_cached_seq:
-            full_k = full_k[:, -max_cached_seq:]
-            full_v = full_v[:, -max_cached_seq:]
+        # Trim to max window
+        total_seq = full_k.shape[2]
+        if total_seq > max_cached_seq:
+            trim_start = total_seq - max_cached_seq
+            full_k = ttnn.slice(full_k, [0, 0, trim_start, 0],
+                                [1, N_HEADS, total_seq, D_HEAD_PAD])
+            full_v = ttnn.slice(full_v, [0, 0, trim_start, 0],
+                                [1, N_HEADS, total_seq, D_HEAD_PAD])
 
         updated.append({'k': full_k, 'v': full_v})
 
@@ -1038,6 +1167,7 @@ if __name__ == "__main__":
 
     scaler_tt = to_tt(torch.ones(TILE, TILE, dtype=torch.bfloat16), tt_device)
     mean_scale_tt = to_tt(torch.full((TILE, TILE), 1.0/D_MODEL, dtype=torch.bfloat16), tt_device)
+    mean_scale_16_tt = to_tt(torch.full((TILE, TILE), 1.0/D_HEAD, dtype=torch.bfloat16), tt_device)
 
     # Pre-load all weights and scratch buffers to device
     dev = preload_weights(state, tt_device)
@@ -1055,7 +1185,7 @@ if __name__ == "__main__":
 
     for fidx in range(N_FRAMES_GEN):
         action = actions[fidx]
-        cached_frames = 0 if kv_cache is None else kv_cache[0]['k'].shape[1] // TOKS_PER_FRAME
+        cached_frames = 0 if kv_cache is None else kv_cache[0]['k'].shape[2] // TOKS_PER_FRAME
         print(f"Frame {fidx+1}/{N_FRAMES_GEN} (action={action}, cached={cached_frames} frames)...")
 
         noise = torch.randn(1, 3, HEIGHT, WIDTH, dtype=torch.bfloat16)
@@ -1063,7 +1193,7 @@ if __name__ == "__main__":
 
         frame, new_kv = sample_frame(
             noise, action, N_STEPS, CFG, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-            kv_cache=kv_cache, frame_idx=fidx)
+            mean_scale_16_tt, kv_cache=kv_cache, frame_idx=fidx)
 
         kv_cache = extend_kv_cache(kv_cache, new_kv, N_WINDOW)
 
