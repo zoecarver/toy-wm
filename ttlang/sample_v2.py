@@ -206,6 +206,52 @@ def silu_kernel(x, out):
                 with out_dfb.wait() as blk:
                     tx = ttl.copy(blk, out[row, sc:sc + ELEM_GRAN]); tx.wait()
 
+SILU_MUL_GRAN = 10  # wider blocks for silu_mul (divides 40, 80)
+
+@ttl.kernel(grid="auto")
+def silu_mul_kernel(up, gate, out):
+    """Fused silu(gate) * up in one kernel. Replaces silu + mul for GEGLU."""
+    grid_cols, _ = ttl.grid_size(dims=2)
+    row_tiles = up.shape[0] // TILE
+    col_blocks = up.shape[1] // TILE // SILU_MUL_GRAN
+    total = row_tiles * col_blocks
+    tiles_per_core = -(-total // grid_cols)
+    u_dfb = ttl.make_dataflow_buffer_like(up, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
+    g_dfb = ttl.make_dataflow_buffer_like(gate, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                with u_dfb.wait() as uv, g_dfb.wait() as gv, out_dfb.reserve() as o:
+                    o.store(uv * gv * ttl.math.sigmoid(gv))
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * SILU_MUL_GRAN
+                with u_dfb.reserve() as blk:
+                    tx = ttl.copy(up[row, sc:sc + SILU_MUL_GRAN], blk); tx.wait()
+                with g_dfb.reserve() as blk:
+                    tx = ttl.copy(gate[row, sc:sc + SILU_MUL_GRAN], blk); tx.wait()
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total:
+                row = t // col_blocks
+                cb = t % col_blocks
+                sc = cb * SILU_MUL_GRAN
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[row, sc:sc + SILU_MUL_GRAN]); tx.wait()
+
 @ttl.kernel(grid="auto")
 def adaln_modulate_kernel(x, shift, scale, out):
     grid_cols, _ = ttl.grid_size(dims=2)
@@ -462,20 +508,20 @@ def make_fused_norm_mod_kernel(dim_tiles):
                             tx = ttl.copy(blk, out[tile_idx, j]); tx.wait()
     return fused_norm_mod
 
-def make_fused_linear_bias_kernel(k_chunk):
-    """Fused linear + bias add in one kernel. Eliminates intermediate DRAM write."""
+def make_fused_linear_bias_kernel(k_chunk, n_chunk=1):
+    """Fused linear + bias add. n_chunk batches output columns to reuse x reads."""
     @ttl.kernel(grid="auto")
     def linear_bias_kernel(x, w, bias, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         m_tiles = x.shape[0] // TILE
-        n_tiles = w.shape[1] // TILE
-        total_out = m_tiles * n_tiles
+        n_blocks = w.shape[1] // TILE // n_chunk
+        total_out = m_tiles * n_blocks
         tiles_per_core = -(-total_out // grid_cols)
         x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_chunk), buffer_factor=2)
-        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, 1), buffer_factor=2)
-        b_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, 1), buffer_factor=2)
-        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, n_chunk), buffer_factor=2)
+        b_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, n_chunk), buffer_factor=2)
+        mm_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, n_chunk), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, n_chunk), buffer_factor=2)
         @ttl.compute()
         def compute():
             core_x, _ = ttl.core(dims=2)
@@ -492,24 +538,26 @@ def make_fused_linear_bias_kernel(k_chunk):
             for local_t in range(tiles_per_core):
                 idx = core_x * tiles_per_core + local_t
                 if idx < total_out:
-                    row = idx // n_tiles
-                    col = idx % n_tiles
+                    row = idx // n_blocks
+                    cb = idx % n_blocks
+                    sc = cb * n_chunk
                     with x_dfb.reserve() as blk:
                         tx = ttl.copy(x[row, 0:k_chunk], blk); tx.wait()
                     with w_dfb.reserve() as blk:
-                        tx = ttl.copy(w[0:k_chunk, col], blk); tx.wait()
+                        tx = ttl.copy(w[0:k_chunk, sc:sc + n_chunk], blk); tx.wait()
                     with b_dfb.reserve() as blk:
-                        tx = ttl.copy(bias[row, col], blk); tx.wait()
+                        tx = ttl.copy(bias[row, sc:sc + n_chunk], blk); tx.wait()
         @ttl.datamovement()
         def dm_write():
             core_x, _ = ttl.core(dims=2)
             for local_t in range(tiles_per_core):
                 idx = core_x * tiles_per_core + local_t
                 if idx < total_out:
-                    row = idx // n_tiles
-                    col = idx % n_tiles
+                    cb = idx % n_blocks
+                    row = idx // n_blocks
+                    sc = cb * n_chunk
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[row, col]); tx.wait()
+                        tx = ttl.copy(blk, out[row, sc:sc + n_chunk]); tx.wait()
     return linear_bias_kernel
 
 def make_fused_norm_rope_kernel(qkv_col_offset):
@@ -624,9 +672,9 @@ rmsnorm_d1 = make_rmsnorm_kernel(1)  # for QK-norm over D_HEAD_PAD=32 (1 tile)
 fused_norm_mod_d320 = make_fused_norm_mod_kernel(D_MODEL // TILE)
 linear_k10 = make_linear_kernel(10)
 linear_k40 = make_linear_kernel(40)
-linear_bias_k10 = make_fused_linear_bias_kernel(10)
-linear_bias_k20 = make_fused_linear_bias_kernel(20)  # for O proj with padded input (640/32=20)
-linear_bias_k40 = make_fused_linear_bias_kernel(40)
+linear_bias_k10 = make_fused_linear_bias_kernel(10, n_chunk=5)
+linear_bias_k20 = make_fused_linear_bias_kernel(20, n_chunk=5)  # for O proj with padded input (640/32=20)
+linear_bias_k40 = make_fused_linear_bias_kernel(40, n_chunk=5)
 
 # Fused modulation broadcast: all 6 params (mu1,sig1,c1,mu2,sig2,c2) in one kernel.
 # 6 separate kernels → 1 kernel, saving 5 launch overheads per block.
@@ -729,6 +777,67 @@ def mod_broadcast_all(src, b1, b2, b3, b4, b5, b6, scaler, o1, o2, o3, o4, o5, o
                 if mod_idx == 5:
                     with out_dfb.wait() as blk:
                         tx = ttl.copy(blk, o6[row, bc:ec]); tx.wait()
+
+FMOD_D_TILES = 20  # 640 / 32 = 20 tile cols for final mod source
+FMOD_BLOCKS_PER_MOD = MOD_SEQ_TILES * (MOD_D_TILES // MOD_GRAN)  # 3 * 2 = 6
+
+@ttl.kernel(grid="auto")
+def final_mod_broadcast(src, scaler, mu_out, sig_out):
+    """Broadcast final modulation from (TILE, 640) row 0 to mu/sigma (SEQ_PADDED, D_MODEL)."""
+    grid_cols, _ = ttl.grid_size(dims=2)
+    total_blocks = 2 * FMOD_BLOCKS_PER_MOD  # 12
+    tiles_per_core = -(-total_blocks // grid_cols)
+    src_dfb = ttl.make_dataflow_buffer_like(src, shape=(1, MOD_GRAN), buffer_factor=2)
+    sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+    red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, MOD_GRAN), buffer_factor=2)
+    bcast_dfb = ttl.make_dataflow_buffer_like(mu_out, shape=(1, MOD_GRAN), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(mu_out, shape=(1, MOD_GRAN), buffer_factor=2)
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.core(dims=2)
+        with sc_dfb.wait() as sc:
+            for local_t in range(tiles_per_core):
+                t = core_x * tiles_per_core + local_t
+                if t < total_blocks:
+                    with src_dfb.wait() as sv:
+                        with red_dfb.reserve() as rd:
+                            rd.store(ttl.math.reduce_sum(sv, sc, dims=[0]))
+                    with red_dfb.wait() as rdv, bcast_dfb.reserve() as bc:
+                        bc.store(ttl.math.broadcast(rdv, dims=[0]))
+                    with bcast_dfb.wait() as bcv, out_dfb.reserve() as o:
+                        o.store(bcv)
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.core(dims=2)
+        with sc_dfb.reserve() as blk:
+            tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_blocks:
+                mod_idx = t // FMOD_BLOCKS_PER_MOD
+                rem = t % FMOD_BLOCKS_PER_MOD
+                cb = rem % MOD_COL_BLOCKS
+                src_col = mod_idx * MOD_D_TILES + cb * MOD_GRAN
+                with src_dfb.reserve() as blk:
+                    tx = ttl.copy(src[0, src_col:src_col + MOD_GRAN], blk); tx.wait()
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.core(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_blocks:
+                mod_idx = t // FMOD_BLOCKS_PER_MOD
+                rem = t % FMOD_BLOCKS_PER_MOD
+                row = rem // MOD_COL_BLOCKS
+                cb = rem % MOD_COL_BLOCKS
+                bc = cb * MOD_GRAN
+                ec = bc + MOD_GRAN
+                if mod_idx == 0:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, mu_out[row, bc:ec]); tx.wait()
+                if mod_idx == 1:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, sig_out[row, bc:ec]); tx.wait()
 
 # ============================================================
 # Host helpers
@@ -874,11 +983,13 @@ def preload_weights(state, tt_device):
             dev[f'{p}.{name}'] = to_tt(
                 w_pad.unsqueeze(0).expand(HEAD_BATCH, -1).contiguous(), tt_device)
 
-        # GEGLU
-        dev[f'{p}.geglu_up_w'] = to_tt(state[f"{p}.geglu.up_proj.weight"].T.contiguous(), tt_device)
-        dev[f'{p}.geglu_up_bias'] = to_tt(expand_bias(state[f"{p}.geglu.up_proj.bias"], SEQ_PADDED), tt_device)
-        dev[f'{p}.geglu_gate_w'] = to_tt(state[f"{p}.geglu.up_gate.weight"].T.contiguous(), tt_device)
-        dev[f'{p}.geglu_gate_bias'] = to_tt(expand_bias(state[f"{p}.geglu.up_gate.bias"], SEQ_PADDED), tt_device)
+        # GEGLU: concatenate up+gate weights/biases for fused matmul
+        up_w = state[f"{p}.geglu.up_proj.weight"].T.contiguous()  # (D_MODEL, D_MID)
+        gate_w = state[f"{p}.geglu.up_gate.weight"].T.contiguous()  # (D_MODEL, D_MID)
+        dev[f'{p}.geglu_upgate_w'] = to_tt(torch.cat([up_w, gate_w], dim=1), tt_device)  # (320, 2560)
+        up_b = expand_bias(state[f"{p}.geglu.up_proj.bias"], SEQ_PADDED)  # (SEQ_PADDED, D_MID)
+        gate_b = expand_bias(state[f"{p}.geglu.up_gate.bias"], SEQ_PADDED)
+        dev[f'{p}.geglu_upgate_bias'] = to_tt(torch.cat([up_b, gate_b], dim=1), tt_device)  # (96, 2560)
         dev[f'{p}.geglu_down_w'] = to_tt(state[f"{p}.geglu.down.weight"].T.contiguous(), tt_device)
         dev[f'{p}.geglu_down_bias'] = to_tt(expand_bias(state[f"{p}.geglu.down.bias"], SEQ_PADDED), tt_device)
 
@@ -906,9 +1017,12 @@ def prealloc_scratch(tt_device):
     """Pre-allocate reusable scratch tensors. Called once at startup."""
     t0 = time.time()
     s = {}
-    # Double-buffer for residual stream (z alternates between a/b across blocks)
+    # Residual stream: z_a/z_b for dit_forward internal, z_euler_a/b for Euler step
     s['z_a'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
     s['z_b'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
+    s['z_euler_a'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
+    s['z_euler_b'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
+    s['z_zero'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)  # permanent zeros for copy
     # (SEQ_PADDED, D_MODEL) scratch - need 3 for norm+mul+adaln chain
     s['d320_a'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
     s['d320_b'] = zeros_tt((SEQ_PADDED, D_MODEL), tt_device)
@@ -919,10 +1033,9 @@ def prealloc_scratch(tt_device):
     s['hb_a'] = zeros_tt((HEAD_BATCH, D_HEAD_PAD), tt_device)
     s['hb_b'] = zeros_tt((HEAD_BATCH, D_HEAD_PAD), tt_device)
     s['hb_c'] = zeros_tt((HEAD_BATCH, D_HEAD_PAD), tt_device)
-    # (SEQ_PADDED, D_MID) scratch for GEGLU - need 3 (u_b + g_a alive for mul)
+    # (SEQ_PADDED, 2*D_MID) for fused up+gate, plus (SEQ_PADDED, D_MID) for silu_mul output
+    s['d2560'] = zeros_tt((SEQ_PADDED, 2 * D_MID), tt_device)
     s['d1280_a'] = zeros_tt((SEQ_PADDED, D_MID), tt_device)
-    s['d1280_b'] = zeros_tt((SEQ_PADDED, D_MID), tt_device)
-    s['d1280_c'] = zeros_tt((SEQ_PADDED, D_MID), tt_device)
     # (TILE, 1920) for modulation
     s['mod_a'] = zeros_tt((TILE, 1920), tt_device)
     s['mod_b'] = zeros_tt((TILE, 1920), tt_device)
@@ -953,42 +1066,31 @@ def prealloc_scratch(tt_device):
 # Forward pass with pre-cached weights + scratch reuse
 # ============================================================
 
-def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+def dit_forward(z_input, time_pe_tt, action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
                 mean_scale_16_tt, rope_tables, kv_cache=None, frame_idx=0):
+    """Forward pass operating entirely on device tensors.
+    z_input: device tensor (SEQ_PADDED, D_MODEL) - preserved (read-only).
+    Returns velocity as device tensor in scr['d320_a']."""
     timers = {}
     def tnow(): return time.time()
 
     t0 = tnow()
-    # Conditioning
-    ts_scaled = int(timestep_float * (T_MAX - 1))
-    action_emb = state["action_emb.weight"][action_idx]
-    time_pe = state["time_emb.pe"][ts_scaled]
-
-    cond_padded = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
-    cond_padded[0] = time_pe
-    linear_k10(to_tt(cond_padded, tt_device), dev['mixer_w'], scr['cond_a'])
-    action_padded = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
-    action_padded[0] = action_emb
+    # Conditioning: all inputs already on device
+    linear_k10(time_pe_tt, dev['mixer_w'], scr['cond_a'])
     add_kernel(scr['cond_a'], dev['mixer_bias'], scr['cond_b'])
-    add_kernel(scr['cond_b'], to_tt(action_padded, tt_device), scr['cond_a'])
+    add_kernel(scr['cond_b'], action_tt, scr['cond_a'])
     silu_kernel(scr['cond_a'], scr['cond_silu'])
-    cond_host = ttnn.to_torch(scr['cond_a'])
-    cond_vec = cond_host[0:1]
     timers['conditioning'] = tnow() - t0
 
+    # Copy z_input → z_a to preserve z_input for Euler step
     t0 = tnow()
-    patched = patch_forward(z_frame, state)
-    reg = state["registers"].unsqueeze(0)
-    patched = torch.cat([patched, reg], dim=1)
-    z_2d = torch.zeros(SEQ_PADDED, D_MODEL, dtype=torch.bfloat16)
-    z_2d[:SEQ] = patched.squeeze(0)
-
-    # z_cur starts as fresh tensor from patch, then alternates with z_next
-    z_cur = to_tt(z_2d, tt_device)
+    add_kernel(z_input, scr['z_zero'], scr['z_a'])
+    z_cur = scr['z_a']
     z_next = scr['z_b']
-    timers['patch'] = tnow() - t0
+    timers['z_copy'] = tnow() - t0
 
     new_kv = []
+    attn_sub = None
 
     block_timers = {k: 0.0 for k in [
         'modulation', 'norm1_mod', 'qkv_proj',
@@ -999,7 +1101,7 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
     for block_idx in range(N_BLOCKS):
         p = f"blocks.{block_idx}"
 
-        # Modulation: linear + fused 6-in-1 broadcast (7 calls → 2)
+        # Modulation: linear + fused 6-in-1 broadcast
         t0 = tnow()
         linear_k10(scr['cond_silu'], dev[f'{p}.mod_w'], scr['mod_a'])
         mod_broadcast_all(scr['mod_a'],
@@ -1009,28 +1111,23 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
             scr['mu1'], scr['sigma1'], scr['c1'], scr['mu2'], scr['sigma2'], scr['c2'])
         block_timers['modulation'] += tnow() - t0
 
-        # Fused RMSNorm1 + weight mul + adaln modulate (3 kernels → 1)
         t0 = tnow()
         fused_norm_mod_d320(z_cur, dev[f'{p}.norm1_w'], scr['mu1'], scr['sigma1'],
                             scaler_tt, mean_scale_tt, scr['d320_a'])
         block_timers['norm1_mod'] += tnow() - t0
 
-        # QKV projection with padded heads → (SEQ_PADDED, 1920) on device
         t0 = tnow()
         linear_bias_k10(scr['d320_a'], dev[f'{p}.qkv_w'], dev[f'{p}.qkv_bias'], scr['qkv_out'])
         block_timers['qkv_proj'] += tnow() - t0
 
-        # Device-side attention: fused QK-norm+RoPE → KV cache → SDPA
         t0 = tnow()
 
-        # Q: fused rmsnorm + weight mul + RoPE (reads directly from qkv_out cols 0-19)
         fused_q_norm_rope(scr['qkv_out'], dev[f'{p}.lnq_w'],
                           rope_tables[block_idx][0], rope_tables[block_idx][1],
                           dev['rope_perm'], scaler_tt, mean_scale_16_tt, scr['hb_c'])
         q_sdpa = ttnn.reshape(scr['hb_c'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         t_q = tnow() - t0
 
-        # K: fused rmsnorm + weight mul + RoPE (reads from qkv_out cols 20-39)
         t1 = tnow()
         fused_k_norm_rope(scr['qkv_out'], dev[f'{p}.lnk_w'],
                           rope_tables[block_idx][0], rope_tables[block_idx][1],
@@ -1038,7 +1135,6 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
         k_new_sdpa = ttnn.reshape(scr['hb_b'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         t_k = tnow() - t1
 
-        # V: just reshape from qkv_out cols 40-59 → (1, 20, 96, 32)
         t1 = tnow()
         v_flat = ttnn.slice(scr['qkv_out'],
                             [0, 2 * N_HEADS * D_HEAD_PAD],
@@ -1048,7 +1144,6 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
         v_sdpa = ttnn.reshape(v_hm, [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         t_v = tnow() - t1
 
-        # KV cache: concat with previous frames' K/V (device tensors)
         t1 = tnow()
         if kv_cache is not None and kv_cache[block_idx] is not None:
             k_sdpa = ttnn.concat([kv_cache[block_idx]['k'], k_new_sdpa], dim=2)
@@ -1059,13 +1154,11 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
         new_kv.append({'k': k_new_sdpa, 'v': v_sdpa})
         t_kv_cache = tnow() - t1
 
-        # SDPA on device
         t1 = tnow()
         attn_out_tt = ttnn.transformer.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_full, is_causal=False, scale=1.0)
         t_sdpa = tnow() - t1
 
-        # Reshape output: (1, 20, 96, 32) → (96, 640) for O projection
         t1 = tnow()
         attn_perm = ttnn.permute(attn_out_tt, [0, 2, 1, 3])
         attn_2d = ttnn.reshape(attn_perm, [SEQ_PADDED, N_HEADS * D_HEAD_PAD])
@@ -1076,67 +1169,49 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
             attn_sub = {'q_norm_rope': t_q, 'k_norm_rope': t_k, 'v_reshape': t_v,
                         'kv_cache': t_kv_cache, 'sdpa': t_sdpa, 'out_reshape': t_out_reshape}
 
-        # O projection with padded weight: (96, 640) @ (640, 320) → (96, 320)
         t0 = tnow()
         linear_bias_k20(attn_2d, dev[f'{p}.o_w'], dev[f'{p}.o_bias'], scr['d320_b'])
         block_timers['o_proj'] += tnow() - t0
 
-        # Gated residual 1: z_next = z_cur + o_biased * c1
         t0 = tnow()
         gated_residual_kernel(z_cur, scr['d320_b'], scr['c1'], z_next)
-        z_cur, z_next = z_next, z_cur  # swap
+        z_cur, z_next = z_next, z_cur
         block_timers['gated_res1'] += tnow() - t0
 
-        # Fused RMSNorm2 + weight mul + adaln modulate (3 kernels → 1)
         t0 = tnow()
         fused_norm_mod_d320(z_cur, dev[f'{p}.norm2_w'], scr['mu2'], scr['sigma2'],
                             scaler_tt, mean_scale_tt, scr['d320_a'])
         block_timers['norm2_mod'] += tnow() - t0
 
         t0 = tnow()
-        # Fused GEGLU: up + gate with bias, silu, mul, down with bias
-        linear_bias_k10(scr['d320_a'], dev[f'{p}.geglu_up_w'], dev[f'{p}.geglu_up_bias'], scr['d1280_b'])
-        linear_bias_k10(scr['d320_a'], dev[f'{p}.geglu_gate_w'], dev[f'{p}.geglu_gate_bias'], scr['d1280_c'])
-        silu_kernel(scr['d1280_c'], scr['d1280_a'])
-        mul_kernel(scr['d1280_b'], scr['d1280_a'], scr['d1280_c'])
-        linear_bias_k40(scr['d1280_c'], dev[f'{p}.geglu_down_w'], dev[f'{p}.geglu_down_bias'], scr['d320_b'])
+        linear_bias_k10(scr['d320_a'], dev[f'{p}.geglu_upgate_w'], dev[f'{p}.geglu_upgate_bias'], scr['d2560'])
+        up_part = ttnn.slice(scr['d2560'], [0, 0], [SEQ_PADDED, D_MID])
+        gate_part = ttnn.slice(scr['d2560'], [0, D_MID], [SEQ_PADDED, 2 * D_MID])
+        silu_mul_kernel(up_part, gate_part, scr['d1280_a'])
+        linear_bias_k40(scr['d1280_a'], dev[f'{p}.geglu_down_w'], dev[f'{p}.geglu_down_bias'], scr['d320_b'])
         block_timers['geglu'] += tnow() - t0
 
-        # Gated residual 2
         t0 = tnow()
         gated_residual_kernel(z_cur, scr['d320_b'], scr['c2'], z_next)
         z_cur, z_next = z_next, z_cur
         block_timers['gated_res2'] += tnow() - t0
 
-    # Final modulation + norm
+    # Final modulation + norm (all on device, no host roundtrip)
     t0 = tnow()
-    cs2 = (cond_vec.float() * torch.sigmoid(cond_vec.float())).to(torch.bfloat16)
-    cs2p = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16); cs2p[0] = cs2[0]
-    linear_k10(to_tt(cs2p, tt_device), dev['final_mod_w'], scr['fm_a'])
+    linear_k10(scr['cond_silu'], dev['final_mod_w'], scr['fm_a'])
     add_kernel(scr['fm_a'], dev['final_mod_bias'], scr['fm_b'])
-    fm_h = ttnn.to_torch(scr['fm_b'])
-    mu_f, sigma_f = fm_h[0, :640].reshape(2, D_MODEL).chunk(2, dim=0)
+    final_mod_broadcast(scr['fm_b'], scaler_tt, scr['mu_f'], scr['sig_f'])
 
     rmsnorm_d320(z_cur, scaler_tt, mean_scale_tt, scr['d320_a'])
     mul_kernel(scr['d320_a'], dev['final_norm_w'], scr['d320_b'])
-
-    mu_fe = to_tt(expand_per_frame(mu_f, TOKS_PER_FRAME, SEQ_PADDED), tt_device)
-    sig_fe = to_tt(expand_per_frame(sigma_f, TOKS_PER_FRAME, SEQ_PADDED), tt_device)
-    adaln_modulate_kernel(scr['d320_b'], mu_fe, sig_fe, scr['d320_a'])
+    adaln_modulate_kernel(scr['d320_b'], scr['mu_f'], scr['sig_f'], scr['d320_a'])
     timers['final_mod'] = tnow() - t0
-
-    t0 = tnow()
-    z_h = ttnn.to_torch(scr['d320_a'])[:SEQ]
-    z_no_reg = z_h[:SEQ-1].unsqueeze(0)
-    out = unpatch_forward(z_no_reg, state)
-    timers['unpatch'] = tnow() - t0
 
     total = sum(timers.values()) + sum(block_timers.values())
     print(f"  dit_forward total: {total*1000:.0f}ms")
     print(f"    conditioning: {timers['conditioning']*1000:.1f}ms")
-    print(f"    patch:        {timers['patch']*1000:.1f}ms")
+    print(f"    z_copy:       {timers['z_copy']*1000:.1f}ms")
     print(f"    final_mod:    {timers['final_mod']*1000:.1f}ms")
-    print(f"    unpatch:      {timers['unpatch']*1000:.1f}ms")
     print(f"    --- 8 blocks ({sum(block_timers.values())*1000:.0f}ms) ---")
     for k, v in sorted(block_timers.items(), key=lambda x: -x[1]):
         pct = v / total * 100 if total > 0 else 0
@@ -1146,7 +1221,8 @@ def dit_forward(z_frame, action_idx, timestep_float, state, dev, scr, tt_device,
         for k, v in attn_sub.items():
             print(f"      {k:20s}: {v*1000:6.2f}ms")
 
-    return out, new_kv
+    # Velocity is in scr['d320_a'], new_kv has KV for cache
+    return new_kv
 
 
 def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
@@ -1154,33 +1230,69 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
     ts = 1 - torch.linspace(0, 1, n_steps + 1)
     ts = 3 * ts / (2 * ts + 1)
 
-    # Build RoPE sin/cos tables for this frame's position offset (constant across denoise steps)
+    # Build RoPE sin/cos tables (constant across denoise steps)
     kv_offset = 0
     if kv_cache is not None and kv_cache[0] is not None:
-        kv_offset = kv_cache[0]['k'].shape[2]  # dim 2 is seq in (1, N_HEADS, seq, D_HEAD_PAD)
+        kv_offset = kv_cache[0]['k'].shape[2]
     rope_tables = build_rope_tables(state, kv_offset, tt_device)
 
-    z = z_noise.clone()
-    new_kv = None
+    # Pre-cache per-frame constants on device (avoid to_tt in hot loop)
+    t_pre = time.time()
+    action_padded = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
+    action_padded[0] = state["action_emb.weight"][action_idx]
+    action_tt = to_tt(action_padded, tt_device)
+
+    # Pre-cache all timestep conditioning tensors
+    time_pe_tts = []
     for i in range(n_steps):
         t_val = ts[i].item()
-        dt = (ts[i] - ts[i+1]).item()
+        ts_scaled = int(t_val * (T_MAX - 1))
+        time_pe = state["time_emb.pe"][ts_scaled]
+        cond_padded = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
+        cond_padded[0] = time_pe
+        time_pe_tts.append(to_tt(cond_padded, tt_device))
 
-        v_cond, new_kv = dit_forward(
-            z, action_idx, t_val, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+    # Pre-cache dt scalars as full (SEQ_PADDED, D_MODEL) tensors for Euler step
+    dt_tts = []
+    for i in range(n_steps):
+        dt = (ts[i] - ts[i+1]).item()
+        dt_tts.append(to_tt(torch.full((SEQ_PADDED, D_MODEL), dt, dtype=torch.bfloat16), tt_device))
+
+    # Patch once: z_noise → token space
+    patched = patch_forward(z_noise, state)
+    reg = state["registers"].unsqueeze(0)
+    patched = torch.cat([patched, reg], dim=1)
+    z_2d = torch.zeros(SEQ_PADDED, D_MODEL, dtype=torch.bfloat16)
+    z_2d[:SEQ] = patched.squeeze(0)
+
+    z_cur = to_tt(z_2d, tt_device)
+    # Copy into euler buffer so we have a stable pair for alternation
+    add_kernel(z_cur, scr['z_zero'], scr['z_euler_a'])
+    z_cur = scr['z_euler_a']
+    z_next = scr['z_euler_b']
+    print(f"  pre-cache + patch: {(time.time() - t_pre)*1000:.1f}ms")
+
+    new_kv = None
+    for i in range(n_steps):
+        # dit_forward: z_cur is preserved (copied to z_a internally)
+        # Velocity output lands in scr['d320_a']
+        new_kv = dit_forward(
+            z_cur, time_pe_tts[i], action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
             mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
 
-        if cfg > 0 and cfg != 1.0:
-            v_uncond, _ = dit_forward(
-                z, 0, t_val, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-                mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
-            v_pred = v_uncond.float() + cfg * (v_cond.float() - v_uncond.float())
-        else:
-            v_pred = v_cond.float()
+        # Euler step on device: z_next = z_cur + dt * velocity
+        mul_kernel(scr['d320_a'], dt_tts[i], scr['d320_b'])
+        add_kernel(z_cur, scr['d320_b'], z_next)
+        z_cur, z_next = z_next, z_cur
 
-        z = (z.float() + dt * v_pred).to(torch.bfloat16)
+    # Unpatch once: token space → image space
+    t_unp = time.time()
+    z_h = ttnn.to_torch(z_cur)[:SEQ]
+    z_no_reg = z_h[:SEQ-1].unsqueeze(0)
+    out = unpatch_forward(z_no_reg, state)
+    print(f"  unpatch: {(time.time() - t_unp)*1000:.1f}ms")
 
-    return z.clamp(-1, 1), new_kv
+    return out.clamp(-1, 1), new_kv
 
 
 def extend_kv_cache(kv_cache, new_kv, n_window):
