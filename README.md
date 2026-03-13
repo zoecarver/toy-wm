@@ -2,7 +2,7 @@
 
 A diffusion transformer world model trained on 9 hours of pong, running interactively on Tenstorrent hardware. The main implementation is in [`ttlang_sample.py`](ttlang_sample.py).
 
-<video src="https://github.com/zoecarver/toy-wm/raw/main/tt-toy-wm-4x.mov" controls width="480"></video>
+[Demo video](tt-toy-wm-4x.mov)
 
 ## Setup
 
