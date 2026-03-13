@@ -566,8 +566,10 @@ def dit_forward(z_frame, action_idx, timestep_float, state, tt_device, scaler_tt
         k_s = F.pad(F.pad(k_r.permute(0,2,1,3), (0,16)), (0,0,0,kv_padded-total_kv_seq))
         v_s = F.pad(F.pad(v_all.permute(0,2,1,3), (0,16)), (0,0,0,kv_padded-total_kv_seq))
 
+        # scale=1.0 matches the original model which uses QK-norm instead of 1/sqrt(d) scaling
         attn_out_tt = ttnn.transformer.scaled_dot_product_attention(
-            to_tt(q_s, tt_device), to_tt(k_s, tt_device), to_tt(v_s, tt_device), is_causal=False)
+            to_tt(q_s, tt_device), to_tt(k_s, tt_device), to_tt(v_s, tt_device),
+            is_causal=False, scale=1.0)
         attn_h = ttnn.to_torch(attn_out_tt)[:, :, :SEQ, :D_HEAD]
         attn_2d = attn_h.permute(0,2,1,3).reshape(SEQ, D_MODEL)
         attn_p = torch.zeros(SEQ_PADDED, D_MODEL, dtype=torch.bfloat16)
@@ -731,9 +733,10 @@ if __name__ == "__main__":
     mean_scale_tt = to_tt(torch.full((TILE, TILE), 1.0/D_MODEL, dtype=torch.bfloat16), tt_device)
 
     # Sampling parameters
-    # NOTE: notebook uses cfg=0 for autoregressive cache generation
+    # cfg=1.0: pure conditional (v_pred = v_cond), no uncond path needed.
+    # The original batches cond+uncond; with cfg=1.0 cond-only cache is self-consistent.
     N_STEPS = 8
-    CFG = 0.0
+    CFG = 1.0
     N_FRAMES_GEN = 30
     N_WINDOW = 30
     FPS = 10
