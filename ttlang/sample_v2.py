@@ -1066,28 +1066,29 @@ def prealloc_scratch(tt_device):
 # Forward pass with pre-cached weights + scratch reuse
 # ============================================================
 
-def dit_forward(z_input, time_pe_tt, action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
                 mean_scale_16_tt, rope_tables, kv_cache=None, frame_idx=0):
-    """Forward pass operating entirely on device tensors.
-    z_input: device tensor (SEQ_PADDED, D_MODEL) - preserved (read-only).
-    Returns velocity as device tensor in scr['d320_a']."""
+    """Forward pass. Patch/unpatch per step (nonlinear), conditioning + final_mod on device."""
     timers = {}
     def tnow(): return time.time()
 
     t0 = tnow()
-    # Conditioning: all inputs already on device
+    # Conditioning: all inputs already on device (no to_tt calls)
     linear_k10(time_pe_tt, dev['mixer_w'], scr['cond_a'])
     add_kernel(scr['cond_a'], dev['mixer_bias'], scr['cond_b'])
     add_kernel(scr['cond_b'], action_tt, scr['cond_a'])
     silu_kernel(scr['cond_a'], scr['cond_silu'])
     timers['conditioning'] = tnow() - t0
 
-    # Copy z_input → z_a to preserve z_input for Euler step
     t0 = tnow()
-    add_kernel(z_input, scr['z_zero'], scr['z_a'])
-    z_cur = scr['z_a']
+    patched = patch_forward(z_frame, state)
+    reg = state["registers"].unsqueeze(0)
+    patched = torch.cat([patched, reg], dim=1)
+    z_2d = torch.zeros(SEQ_PADDED, D_MODEL, dtype=torch.bfloat16)
+    z_2d[:SEQ] = patched.squeeze(0)
+    z_cur = to_tt(z_2d, tt_device)
     z_next = scr['z_b']
-    timers['z_copy'] = tnow() - t0
+    timers['patch'] = tnow() - t0
 
     new_kv = []
     attn_sub = None
@@ -1101,14 +1102,22 @@ def dit_forward(z_input, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
     for block_idx in range(N_BLOCKS):
         p = f"blocks.{block_idx}"
 
-        # Modulation: linear + fused 6-in-1 broadcast
+        # TODO: re-enable mod_broadcast_all once debugged (~8ms -> ~3.6ms).
+        # Device-side version:
+        #   linear_k10(scr['cond_silu'], dev[f'{p}.mod_w'], scr['mod_a'])
+        #   mod_broadcast_all(scr['mod_a'],
+        #       dev[f'{p}.mod_bias_mu1'], ..., dev[f'{p}.mod_bias_c2'],
+        #       scaler_tt, scr['mu1'], ..., scr['c2'])
+        # The kernel reads src row 0 via reduce_sum(dims=[0]) + broadcast(dims=[0])
+        # but produces wrong values. Needs investigation.
         t0 = tnow()
         linear_k10(scr['cond_silu'], dev[f'{p}.mod_w'], scr['mod_a'])
-        mod_broadcast_all(scr['mod_a'],
-            dev[f'{p}.mod_bias_mu1'], dev[f'{p}.mod_bias_sigma1'], dev[f'{p}.mod_bias_c1'],
-            dev[f'{p}.mod_bias_mu2'], dev[f'{p}.mod_bias_sigma2'], dev[f'{p}.mod_bias_c2'],
-            scaler_tt,
-            scr['mu1'], scr['sigma1'], scr['c1'], scr['mu2'], scr['sigma2'], scr['c2'])
+        mod_h = ttnn.to_torch(scr['mod_a'])
+        mod_h[0] = mod_h[0] + state[f"{p}.modulation.1.bias"]
+        chunks = mod_h[0, :D_MODEL*6].reshape(6, D_MODEL)
+        for ci, buf in enumerate(['mu1', 'sigma1', 'c1', 'mu2', 'sigma2', 'c2']):
+            expanded = chunks[ci].unsqueeze(0).expand(SEQ_PADDED, -1).contiguous()
+            scr[buf] = to_tt(expanded, tt_device)
         block_timers['modulation'] += tnow() - t0
 
         t0 = tnow()
@@ -1151,7 +1160,7 @@ def dit_forward(z_input, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         else:
             k_sdpa = k_new_sdpa
             v_full = v_sdpa
-        new_kv.append({'k': k_new_sdpa, 'v': v_sdpa})
+        new_kv.append({'k': ttnn.clone(k_new_sdpa), 'v': ttnn.clone(v_sdpa)})
         t_kv_cache = tnow() - t1
 
         t1 = tnow()
@@ -1196,22 +1205,35 @@ def dit_forward(z_input, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         z_cur, z_next = z_next, z_cur
         block_timers['gated_res2'] += tnow() - t0
 
-    # Final modulation + norm (all on device, no host roundtrip)
+    # TODO: re-enable final_mod_broadcast once debugged. Device-side version:
+    #   final_mod_broadcast(scr['fm_b'], scaler_tt, scr['mu_f'], scr['sig_f'])
+    # Same reduce_sum/broadcast bug as mod_broadcast_all.
     t0 = tnow()
     linear_k10(scr['cond_silu'], dev['final_mod_w'], scr['fm_a'])
     add_kernel(scr['fm_a'], dev['final_mod_bias'], scr['fm_b'])
-    final_mod_broadcast(scr['fm_b'], scaler_tt, scr['mu_f'], scr['sig_f'])
+    fm_h = ttnn.to_torch(scr['fm_b'])
+    mu_f, sigma_f = fm_h[0, :640].reshape(2, D_MODEL).chunk(2, dim=0)
 
     rmsnorm_d320(z_cur, scaler_tt, mean_scale_tt, scr['d320_a'])
     mul_kernel(scr['d320_a'], dev['final_norm_w'], scr['d320_b'])
-    adaln_modulate_kernel(scr['d320_b'], scr['mu_f'], scr['sig_f'], scr['d320_a'])
+
+    mu_fe = to_tt(expand_per_frame(mu_f, TOKS_PER_FRAME, SEQ_PADDED), tt_device)
+    sig_fe = to_tt(expand_per_frame(sigma_f, TOKS_PER_FRAME, SEQ_PADDED), tt_device)
+    adaln_modulate_kernel(scr['d320_b'], mu_fe, sig_fe, scr['d320_a'])
     timers['final_mod'] = tnow() - t0
+
+    t0 = tnow()
+    z_h = ttnn.to_torch(scr['d320_a'])[:SEQ]
+    z_no_reg = z_h[:SEQ-1].unsqueeze(0)
+    out = unpatch_forward(z_no_reg, state)
+    timers['unpatch'] = tnow() - t0
 
     total = sum(timers.values()) + sum(block_timers.values())
     print(f"  dit_forward total: {total*1000:.0f}ms")
     print(f"    conditioning: {timers['conditioning']*1000:.1f}ms")
-    print(f"    z_copy:       {timers['z_copy']*1000:.1f}ms")
+    print(f"    patch:        {timers['patch']*1000:.1f}ms")
     print(f"    final_mod:    {timers['final_mod']*1000:.1f}ms")
+    print(f"    unpatch:      {timers['unpatch']*1000:.1f}ms")
     print(f"    --- 8 blocks ({sum(block_timers.values())*1000:.0f}ms) ---")
     for k, v in sorted(block_timers.items(), key=lambda x: -x[1]):
         pct = v / total * 100 if total > 0 else 0
@@ -1221,8 +1243,7 @@ def dit_forward(z_input, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         for k, v in attn_sub.items():
             print(f"      {k:20s}: {v*1000:6.2f}ms")
 
-    # Velocity is in scr['d320_a'], new_kv has KV for cache
-    return new_kv
+    return out, new_kv
 
 
 def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
@@ -1231,9 +1252,8 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
     ts = 3 * ts / (2 * ts + 1)
 
     # Build RoPE sin/cos tables (constant across denoise steps)
-    kv_offset = 0
-    if kv_cache is not None and kv_cache[0] is not None:
-        kv_offset = kv_cache[0]['k'].shape[2]
+    # Use real token count (frame_idx * TOKS_PER_FRAME), not padded cache shape
+    kv_offset = frame_idx * TOKS_PER_FRAME
     rope_tables = build_rope_tables(state, kv_offset, tt_device)
 
     # Pre-cache per-frame constants on device (avoid to_tt in hot loop)
@@ -1251,48 +1271,34 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
         cond_padded = torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16)
         cond_padded[0] = time_pe
         time_pe_tts.append(to_tt(cond_padded, tt_device))
+    print(f"  pre-cache: {(time.time() - t_pre)*1000:.1f}ms")
 
-    # Pre-cache dt scalars as full (SEQ_PADDED, D_MODEL) tensors for Euler step
-    dt_tts = []
-    for i in range(n_steps):
-        dt = (ts[i] - ts[i+1]).item()
-        dt_tts.append(to_tt(torch.full((SEQ_PADDED, D_MODEL), dt, dtype=torch.bfloat16), tt_device))
-
-    # Patch once: z_noise → token space
-    patched = patch_forward(z_noise, state)
-    reg = state["registers"].unsqueeze(0)
-    patched = torch.cat([patched, reg], dim=1)
-    z_2d = torch.zeros(SEQ_PADDED, D_MODEL, dtype=torch.bfloat16)
-    z_2d[:SEQ] = patched.squeeze(0)
-
-    z_cur = to_tt(z_2d, tt_device)
-    # Copy into euler buffer so we have a stable pair for alternation
-    add_kernel(z_cur, scr['z_zero'], scr['z_euler_a'])
-    z_cur = scr['z_euler_a']
-    z_next = scr['z_euler_b']
-    print(f"  pre-cache + patch: {(time.time() - t_pre)*1000:.1f}ms")
-
+    # TODO: per-step patch/unpatch is required because patch_forward is nonlinear
+    # (conv2d + SiLU + group_norm). If patch were linear, we could patch once,
+    # do Euler steps in token space on device, and unpatch once at the end.
+    # That would save ~3ms/step in patch+unpatch host overhead.
+    z = z_noise.clone()
     new_kv = None
     for i in range(n_steps):
-        # dit_forward: z_cur is preserved (copied to z_a internally)
-        # Velocity output lands in scr['d320_a']
-        new_kv = dit_forward(
-            z_cur, time_pe_tts[i], action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+        t_val = ts[i].item()
+        dt = (ts[i] - ts[i+1]).item()
+
+        v_cond, new_kv = dit_forward(
+            z, time_pe_tts[i], action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
             mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
 
-        # Euler step on device: z_next = z_cur + dt * velocity
-        mul_kernel(scr['d320_a'], dt_tts[i], scr['d320_b'])
-        add_kernel(z_cur, scr['d320_b'], z_next)
-        z_cur, z_next = z_next, z_cur
+        if cfg > 0 and cfg != 1.0:
+            v_uncond, _ = dit_forward(
+                z, time_pe_tts[i], to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device),
+                state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
+                mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
+            v_pred = v_uncond.float() + cfg * (v_cond.float() - v_uncond.float())
+        else:
+            v_pred = v_cond.float()
 
-    # Unpatch once: token space → image space
-    t_unp = time.time()
-    z_h = ttnn.to_torch(z_cur)[:SEQ]
-    z_no_reg = z_h[:SEQ-1].unsqueeze(0)
-    out = unpatch_forward(z_no_reg, state)
-    print(f"  unpatch: {(time.time() - t_unp)*1000:.1f}ms")
+        z = (z.float() + dt * v_pred).to(torch.bfloat16)
 
-    return out.clamp(-1, 1), new_kv
+    return z.clamp(-1, 1), new_kv
 
 
 def extend_kv_cache(kv_cache, new_kv, n_window):

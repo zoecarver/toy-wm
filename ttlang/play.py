@@ -23,9 +23,10 @@ import ttl
 import http.server
 import threading
 
-from sample import (
-    dit_forward, sample_frame, extend_kv_cache, to_tt, zeros_tt,
-    D_MODEL, TILE, N_BLOCKS, TOKS_PER_FRAME, HEIGHT, WIDTH,
+from sample_v2 import (
+    sample_frame, extend_kv_cache, preload_weights, prealloc_scratch,
+    to_tt, zeros_tt,
+    D_MODEL, D_HEAD, TILE, N_BLOCKS, TOKS_PER_FRAME, HEIGHT, WIDTH,
 )
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -121,8 +122,11 @@ class GameState:
     def __init__(self):
         self.tt_device = None
         self.state = None
+        self.dev = None
+        self.scr = None
         self.scaler_tt = None
         self.mean_scale_tt = None
+        self.mean_scale_16_tt = None
         self.kv_cache = None
         self.frame_idx = 0
         self.n_steps = 8
@@ -139,8 +143,13 @@ class GameState:
         self.state = {k.replace("_orig_mod.", ""): v.to(torch.bfloat16) for k, v in ckpt.items()}
         self.scaler_tt = to_tt(torch.ones(TILE, TILE, dtype=torch.bfloat16), self.tt_device)
         self.mean_scale_tt = to_tt(
-            torch.full((TILE, TILE), 1.0 / D_MODEL, dtype=torch.bfloat16), self.tt_device
-        )
+            torch.full((TILE, TILE), 1.0 / D_MODEL, dtype=torch.bfloat16), self.tt_device)
+        self.mean_scale_16_tt = to_tt(
+            torch.full((TILE, TILE), 1.0 / D_HEAD, dtype=torch.bfloat16), self.tt_device)
+        print("Pre-loading weights to device...")
+        self.dev = preload_weights(self.state, self.tt_device)
+        print("Pre-allocating scratch buffers...")
+        self.scr = prealloc_scratch(self.tt_device)
         print("Model ready!")
 
     def generate_frame(self, action):
@@ -149,12 +158,13 @@ class GameState:
             t0 = time.time()
             frame, new_kv = sample_frame(
                 noise, action, self.n_steps, self.cfg,
-                self.state, self.tt_device, self.scaler_tt, self.mean_scale_tt,
+                self.state, self.dev, self.scr, self.tt_device,
+                self.scaler_tt, self.mean_scale_tt, self.mean_scale_16_tt,
                 kv_cache=self.kv_cache, frame_idx=self.frame_idx,
             )
             self.kv_cache = extend_kv_cache(self.kv_cache, new_kv, self.n_window)
             elapsed = time.time() - t0
-            cached_frames = 0 if self.kv_cache is None else self.kv_cache[0]['k'].shape[1] // TOKS_PER_FRAME
+            cached_frames = self.frame_idx
             fidx = self.frame_idx
             self.frame_idx += 1
 
