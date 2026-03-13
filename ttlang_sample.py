@@ -254,49 +254,52 @@ def add_silu_kernel(a, b, out):
 
 SILU_MUL_GRAN = 10  # wider blocks for silu_mul (divides 40, 80)
 
-@ttl.kernel(grid="auto")
-def silu_mul_kernel(up, gate, out):
-    """Fused silu(gate) * up in one kernel. Replaces silu + mul for GEGLU."""
-    grid_cols, _ = ttl.grid_size(dims=2)
-    row_tiles = up.shape[0] // TILE
-    col_blocks = up.shape[1] // TILE // SILU_MUL_GRAN
-    total = row_tiles * col_blocks
-    tiles_per_core = -(-total // grid_cols)
-    u_dfb = ttl.make_dataflow_buffer_like(up, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
-    g_dfb = ttl.make_dataflow_buffer_like(gate, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
-    @ttl.compute()
-    def compute():
-        core_x, _ = ttl.core(dims=2)
-        for local_t in range(tiles_per_core):
-            t = core_x * tiles_per_core + local_t
-            if t < total:
-                with u_dfb.wait() as uv, g_dfb.wait() as gv, out_dfb.reserve() as o:
-                    o.store(uv * gv * ttl.math.sigmoid(gv))
-    @ttl.datamovement()
-    def dm_read():
-        core_x, _ = ttl.core(dims=2)
-        for local_t in range(tiles_per_core):
-            t = core_x * tiles_per_core + local_t
-            if t < total:
-                row = t // col_blocks
-                cb = t % col_blocks
-                sc = cb * SILU_MUL_GRAN
-                with u_dfb.reserve() as blk:
-                    tx = ttl.copy(up[row, sc:sc + SILU_MUL_GRAN], blk); tx.wait()
-                with g_dfb.reserve() as blk:
-                    tx = ttl.copy(gate[row, sc:sc + SILU_MUL_GRAN], blk); tx.wait()
-    @ttl.datamovement()
-    def dm_write():
-        core_x, _ = ttl.core(dims=2)
-        for local_t in range(tiles_per_core):
-            t = core_x * tiles_per_core + local_t
-            if t < total:
-                row = t // col_blocks
-                cb = t % col_blocks
-                sc = cb * SILU_MUL_GRAN
-                with out_dfb.wait() as blk:
-                    tx = ttl.copy(blk, out[row, sc:sc + SILU_MUL_GRAN]); tx.wait()
+def make_silu_mul_from_concat_kernel(half_col_tiles):
+    """Fused silu(gate) * up reading directly from concatenated [up|gate] tensor.
+    Eliminates 2 ttnn.slice calls per GEGLU block."""
+    @ttl.kernel(grid="auto")
+    def silu_mul_concat(upgate, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        row_tiles = out.shape[0] // TILE
+        col_blocks = half_col_tiles // SILU_MUL_GRAN
+        total = row_tiles * col_blocks
+        tiles_per_core = -(-total // grid_cols)
+        u_dfb = ttl.make_dataflow_buffer_like(upgate, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
+        g_dfb = ttl.make_dataflow_buffer_like(upgate, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, SILU_MUL_GRAN), buffer_factor=2)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                t = core_x * tiles_per_core + local_t
+                if t < total:
+                    with u_dfb.wait() as uv, g_dfb.wait() as gv, out_dfb.reserve() as o:
+                        o.store(uv * gv * ttl.math.sigmoid(gv))
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                t = core_x * tiles_per_core + local_t
+                if t < total:
+                    row = t // col_blocks
+                    cb = t % col_blocks
+                    sc = cb * SILU_MUL_GRAN
+                    with u_dfb.reserve() as blk:
+                        tx = ttl.copy(upgate[row, sc:sc + SILU_MUL_GRAN], blk); tx.wait()
+                    with g_dfb.reserve() as blk:
+                        tx = ttl.copy(upgate[row, half_col_tiles + sc:half_col_tiles + sc + SILU_MUL_GRAN], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.core(dims=2)
+            for local_t in range(tiles_per_core):
+                t = core_x * tiles_per_core + local_t
+                if t < total:
+                    row = t // col_blocks
+                    cb = t % col_blocks
+                    sc = cb * SILU_MUL_GRAN
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[row, sc:sc + SILU_MUL_GRAN]); tx.wait()
+    return silu_mul_concat
 
 @ttl.kernel(grid="auto")
 def adaln_modulate_kernel(x, shift, scale, out):
@@ -787,6 +790,7 @@ linear_bias_k40 = make_fused_linear_bias_kernel(40, n_chunk=5)
 # Fused linear+bias+gated_residual: eliminates DRAM round-trip between matmul and residual add
 linear_bias_gated_res_k20 = make_fused_linear_bias_gated_res_kernel(20, n_chunk=5)  # O proj + gated_res1
 linear_bias_gated_res_k40 = make_fused_linear_bias_gated_res_kernel(40, n_chunk=5)  # GEGLU down + gated_res2
+silu_mul_from_concat = make_silu_mul_from_concat_kernel(D_MID // TILE)  # reads directly from (96, 2560)
 
 # Fused modulation broadcast: all 6 params (mu1,sig1,c1,mu2,sig2,c2) in one kernel.
 # 6 separate kernels → 1 kernel, saving 5 launch overheads per block.
@@ -1318,9 +1322,7 @@ def dit_forward(z_frame, time_pe_tt, cond_bias_action_tt, state, dev, scr, tt_de
 
         t0 = tnow()
         linear_bias_k10(scr['d320_a'], dev[f'{p}.geglu_upgate_w'], dev[f'{p}.geglu_upgate_bias'], scr['d2560'])
-        up_part = ttnn.slice(scr['d2560'], [0, 0], [SEQ_PADDED, D_MID])
-        gate_part = ttnn.slice(scr['d2560'], [0, D_MID], [SEQ_PADDED, 2 * D_MID])
-        silu_mul_kernel(up_part, gate_part, scr['d1280_a'])
+        silu_mul_from_concat(scr['d2560'], scr['d1280_a'])
         linear_bias_gated_res_k40(scr['d1280_a'], dev[f'{p}.geglu_down_w'], dev[f'{p}.geglu_down_bias'],
                                    z_cur, scr['c2'], z_next)
         z_cur, z_next = z_next, z_cur
