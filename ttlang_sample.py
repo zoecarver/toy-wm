@@ -782,10 +782,11 @@ fused_k_norm_rope = make_fused_norm_rope_kernel(N_HEADS)     # K cols 20-39
 SEQ_TILES_QK = SEQ_PADDED // TILE  # 3
 
 @ttl.kernel(grid="auto")
-def fused_qk_norm_rope(qkv, lnq_w, lnk_w, sin_tab, cos_tab, perm, scaler, mean_scale, q_out, k_out):
-    """Fused QK norm+rope in one launch. First N_HEADS*SEQ_TILES tiles are Q, next are K."""
+def fused_qkv_norm_rope(qkv, lnq_w, lnk_w, sin_tab, cos_tab, perm, scaler, mean_scale, q_out, k_out, v_out):
+    """Fused QKV: norm+rope for Q/K, passthrough for V. Eliminates 4 ttnn ops per block."""
     grid_cols, _ = ttl.grid_size(dims=2)
-    total_tiles = 2 * N_HEADS * SEQ_TILES_QK  # 120
+    tiles_per_half = N_HEADS * SEQ_TILES_QK  # 60
+    total_tiles = 3 * tiles_per_half  # 180
     tiles_per_core = -(-total_tiles // grid_cols)
 
     x_dfb = ttl.make_dataflow_buffer_like(qkv, shape=(1, 1), buffer_factor=2)
@@ -810,24 +811,31 @@ def fused_qk_norm_rope(qkv, lnq_w, lnk_w, sin_tab, cos_tab, perm, scaler, mean_s
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
                 if t < total_tiles:
-                    with x_dfb.wait() as x0:
-                        with sq_dfb.reserve() as sq:
-                            sq.store(x0 * x0)
-                    with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
-                        r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
-                    with red_dfb.wait() as rv, bcast_dfb.reserve() as bc:
-                        bc.store(ttl.math.broadcast(rv, dims=[1]))
-                    with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
-                        scaled.store(bv * ms + ttl.math.fill(bv, 1e-5))
-                    with red_dfb.wait() as msq, rsq_dfb.reserve() as rsq:
-                        rsq.store(ttl.math.rsqrt(msq))
-                    with rsq_dfb.wait() as rsqv:
-                        with x_dfb.wait() as x1, nw_dfb.wait() as nw, sq_dfb.reserve() as normed:
-                            normed.store(x1 * rsqv * nw)
-                        with sq_dfb.wait() as nv, pm_dfb.reserve() as pm:
-                            pm.store(nv @ p)
-                        with x_dfb.wait() as x2, nw_dfb.wait() as nw2, pm_dfb.wait() as pv, sin_dfb.wait() as sv, cos_dfb.wait() as cv, out_dfb.reserve() as o:
-                            o.store(cv * (x2 * rsqv * nw2) + sv * pv)
+                    half = t // tiles_per_half
+                    if half < 2:
+                        # Q or K: RMSNorm + RoPE
+                        with x_dfb.wait() as x0:
+                            with sq_dfb.reserve() as sq:
+                                sq.store(x0 * x0)
+                        with sq_dfb.wait() as sqv, red_dfb.reserve() as r:
+                            r.store(ttl.math.reduce_sum(sqv, sc, dims=[1]))
+                        with red_dfb.wait() as rv, bcast_dfb.reserve() as bc:
+                            bc.store(ttl.math.broadcast(rv, dims=[1]))
+                        with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
+                            scaled.store(bv * ms + ttl.math.fill(bv, 1e-5))
+                        with red_dfb.wait() as msq, rsq_dfb.reserve() as rsq:
+                            rsq.store(ttl.math.rsqrt(msq))
+                        with rsq_dfb.wait() as rsqv:
+                            with x_dfb.wait() as x1, nw_dfb.wait() as nw, sq_dfb.reserve() as normed:
+                                normed.store(x1 * rsqv * nw)
+                            with sq_dfb.wait() as nv, pm_dfb.reserve() as pm:
+                                pm.store(nv @ p)
+                            with x_dfb.wait() as x2, nw_dfb.wait() as nw2, pm_dfb.wait() as pv, sin_dfb.wait() as sv, cos_dfb.wait() as cv, out_dfb.reserve() as o:
+                                o.store(cv * (x2 * rsqv * nw2) + sv * pv)
+                    if half == 2:
+                        # V: passthrough (no norm, no rope)
+                        with x_dfb.wait() as xv, out_dfb.reserve() as o:
+                            o.store(xv)
 
     @ttl.datamovement()
     def dm_read():
@@ -841,36 +849,40 @@ def fused_qk_norm_rope(qkv, lnq_w, lnk_w, sin_tab, cos_tab, perm, scaler, mean_s
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
-                # First half: Q (col offset 0), second half: K (col offset N_HEADS)
-                half = t // (N_HEADS * SEQ_TILES_QK)
-                t_in_half = t % (N_HEADS * SEQ_TILES_QK)
+                half = t // tiles_per_half
+                t_in_half = t % tiles_per_half
                 head = t_in_half // SEQ_TILES_QK
                 seq_r = t_in_half % SEQ_TILES_QK
                 qkv_col = half * N_HEADS + head
                 out_row = head * SEQ_TILES_QK + seq_r
-                # Norm weight: Q uses lnq_w, K uses lnk_w
-                with x_dfb.reserve() as blk:
-                    tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
-                with x_dfb.reserve() as blk:
-                    tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
-                if half == 0:
-                    with nw_dfb.reserve() as blk:
-                        tx = ttl.copy(lnq_w[out_row, 0], blk); tx.wait()
-                if half == 1:
-                    with nw_dfb.reserve() as blk:
-                        tx = ttl.copy(lnk_w[out_row, 0], blk); tx.wait()
-                with x_dfb.reserve() as blk:
-                    tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
-                if half == 0:
-                    with nw_dfb.reserve() as blk:
-                        tx = ttl.copy(lnq_w[out_row, 0], blk); tx.wait()
-                if half == 1:
-                    with nw_dfb.reserve() as blk:
-                        tx = ttl.copy(lnk_w[out_row, 0], blk); tx.wait()
-                with sin_dfb.reserve() as blk:
-                    tx = ttl.copy(sin_tab[out_row, 0], blk); tx.wait()
-                with cos_dfb.reserve() as blk:
-                    tx = ttl.copy(cos_tab[out_row, 0], blk); tx.wait()
+                if half < 2:
+                    # Q/K: 3 reads of x, 2 reads of norm weight, 1 sin, 1 cos
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
+                    if half == 0:
+                        with nw_dfb.reserve() as blk:
+                            tx = ttl.copy(lnq_w[out_row, 0], blk); tx.wait()
+                    if half == 1:
+                        with nw_dfb.reserve() as blk:
+                            tx = ttl.copy(lnk_w[out_row, 0], blk); tx.wait()
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
+                    if half == 0:
+                        with nw_dfb.reserve() as blk:
+                            tx = ttl.copy(lnq_w[out_row, 0], blk); tx.wait()
+                    if half == 1:
+                        with nw_dfb.reserve() as blk:
+                            tx = ttl.copy(lnk_w[out_row, 0], blk); tx.wait()
+                    with sin_dfb.reserve() as blk:
+                        tx = ttl.copy(sin_tab[out_row, 0], blk); tx.wait()
+                    with cos_dfb.reserve() as blk:
+                        tx = ttl.copy(cos_tab[out_row, 0], blk); tx.wait()
+                if half == 2:
+                    # V: single read
+                    with x_dfb.reserve() as blk:
+                        tx = ttl.copy(qkv[seq_r, qkv_col], blk); tx.wait()
 
     @ttl.datamovement()
     def dm_write():
@@ -878,8 +890,8 @@ def fused_qk_norm_rope(qkv, lnq_w, lnk_w, sin_tab, cos_tab, perm, scaler, mean_s
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
-                half = t // (N_HEADS * SEQ_TILES_QK)
-                t_in_half = t % (N_HEADS * SEQ_TILES_QK)
+                half = t // tiles_per_half
+                t_in_half = t % tiles_per_half
                 head = t_in_half // SEQ_TILES_QK
                 seq_r = t_in_half % SEQ_TILES_QK
                 out_row = head * SEQ_TILES_QK + seq_r
@@ -889,6 +901,9 @@ def fused_qk_norm_rope(qkv, lnq_w, lnk_w, sin_tab, cos_tab, perm, scaler, mean_s
                 if half == 1:
                     with out_dfb.wait() as blk:
                         tx = ttl.copy(blk, k_out[out_row, 0]); tx.wait()
+                if half == 2:
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, v_out[out_row, 0]); tx.wait()
 
 
 rmsnorm_d320 = make_rmsnorm_kernel(D_MODEL // TILE)
@@ -1061,6 +1076,10 @@ def final_mod_broadcast(src, scaler, mu_out, sig_out):
 def to_tt(t, device):
     return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                            device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+def to_tt_l1(t, device):
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                           device=device, memory_config=ttnn.L1_MEMORY_CONFIG)
 
 def zeros_tt(shape, device):
     return to_tt(torch.zeros(shape, dtype=torch.bfloat16), device)
@@ -1252,7 +1271,7 @@ def preload_weights(state, tt_device):
     for i in range(D_HEAD // 2):
         P[2*i+1, 2*i] = -1.0
         P[2*i, 2*i+1] = 1.0
-    dev['rope_perm'] = to_tt(P, tt_device)
+    dev['rope_perm'] = to_tt_l1(P, tt_device)
 
     elapsed = time.time() - t0
     print(f"Preloaded {len(dev)} tensors to device in {elapsed:.1f}s")
@@ -1368,23 +1387,16 @@ def dit_forward(z_frame, time_pe_tt, cond_bias_action_tt, state, dev, scr, tt_de
 
         t0 = tnow()
 
-        fused_qk_norm_rope(scr['qkv_out'], dev[f'{p}.lnq_w'], dev[f'{p}.lnk_w'],
-                           rope_tables[block_idx][0], rope_tables[block_idx][1],
-                           dev['rope_perm'], scaler_tt, mean_scale_16_tt,
-                           scr['hb_c'], scr['hb_b'])
+        fused_qkv_norm_rope(scr['qkv_out'], dev[f'{p}.lnq_w'], dev[f'{p}.lnk_w'],
+                            rope_tables[block_idx][0], rope_tables[block_idx][1],
+                            dev['rope_perm'], scaler_tt, mean_scale_16_tt,
+                            scr['hb_c'], scr['hb_b'], scr['hb_a'])
         q_sdpa = ttnn.reshape(scr['hb_c'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         k_new = ttnn.reshape(scr['hb_b'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
+        v_new = ttnn.reshape(scr['hb_a'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         t_q = tnow() - t0
         t_k = 0.0
-
-        t1 = tnow()
-        v_flat = ttnn.slice(scr['qkv_out'],
-                            [0, 2 * N_HEADS * D_HEAD_PAD],
-                            [SEQ_PADDED, 3 * N_HEADS * D_HEAD_PAD])
-        v_3d = ttnn.reshape(v_flat, [SEQ_PADDED, N_HEADS, D_HEAD_PAD])
-        v_hm = ttnn.permute(v_3d, [1, 0, 2])
-        v_new = ttnn.reshape(v_hm, [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
-        t_v = tnow() - t1
+        t_v = 0.0
 
         # Device-side KV cache: concat new K/V with cached K/V on device
         t1 = tnow()
@@ -1560,9 +1572,10 @@ if __name__ == "__main__":
     ckpt = torch.load("/tmp/model.pt", map_location="cpu", weights_only=False)
     state = {k.replace("_orig_mod.", ""): v.to(torch.bfloat16) for k, v in ckpt.items()}
 
-    scaler_tt = to_tt(torch.ones(TILE, TILE, dtype=torch.bfloat16), tt_device)
-    mean_scale_tt = to_tt(torch.full((TILE, TILE), 1.0/D_MODEL, dtype=torch.bfloat16), tt_device)
-    mean_scale_16_tt = to_tt(torch.full((TILE, TILE), 1.0/D_HEAD, dtype=torch.bfloat16), tt_device)
+    # Small constant tensors in L1 to avoid DRAM reads (each 2KB, read 50+ times/step)
+    scaler_tt = to_tt_l1(torch.ones(TILE, TILE, dtype=torch.bfloat16), tt_device)
+    mean_scale_tt = to_tt_l1(torch.full((TILE, TILE), 1.0/D_MODEL, dtype=torch.bfloat16), tt_device)
+    mean_scale_16_tt = to_tt_l1(torch.full((TILE, TILE), 1.0/D_HEAD, dtype=torch.bfloat16), tt_device)
 
     # Pre-load all weights and scratch buffers to device
     dev = preload_weights(state, tt_device)
