@@ -36,6 +36,7 @@ import sample_v2 as v2
 
 dev = v2.preload_weights(state, device)
 scr = v2.prealloc_scratch(device)
+v2.extend_rope_tables(state)
 
 N_STEPS = 8
 CFG = 1.0
@@ -58,19 +59,18 @@ for fidx in range(3):
     v1_kv = v1.extend_kv_cache(v1_kv, nkv1, 30)
 
     # V2
-    v2_cached = 0 if v2_kv is None else v2_kv[0]['k'].shape[2]
-    v2_rope_offset = fidx * TOKS_PER_FRAME
-    print(f"V2 cache: {v2_cached} tokens, RoPE offset: {v2_rope_offset}")
+    v2_cached = 0 if v2_kv is None else v2_kv[0]['k'].shape[2] // SEQ_PADDED
+    print(f"V2 cache: {v2_cached} frames")
     frame_v2, nkv2 = v2.sample_frame(
         noise.clone(), 2, N_STEPS, CFG, state, dev, scr, device, scaler_tt, mean_scale_tt,
-        mean_scale_16_tt, kv_cache=v2_kv, frame_idx=fidx)
-    v2_kv = v2.extend_kv_cache(v2_kv, nkv2, 30)
+        mean_scale_16_tt, device_kv_cache=v2_kv, frame_idx=fidx)
+    v2_kv = v2.trim_kv_cache(nkv2, 30)
 
     diff = (frame_v1.float() - frame_v2.float()).abs()
     print(f"Max diff: {diff.max().item():.4f}  Mean diff: {diff.mean().item():.4f}")
     print(f"V1 mean: {frame_v1.float().mean().item():.6f}  V2 mean: {frame_v2.float().mean().item():.6f}")
 
 print(f"\nFinal V1 cache: {v1_kv[0]['k'].shape[1]} tokens")
-print(f"Final V2 cache: {v2_kv[0]['k'].shape[2]} tokens")
+print(f"Final V2 cache: {v2_kv[0]['k'].shape[2]} padded tokens")
 
 ttnn.close_device(device)

@@ -901,6 +901,35 @@ def apply_rope(x, sins, coss):
     x_perm[:, :, :, odd] = x[:, :, :, even]
     return (coss * x.float() + sins * x_perm.float()).to(x.dtype)
 
+ROPE_C = 5000
+
+def extend_rope_tables(state, max_pos=100000):
+    """Extend stored RoPE sin/cos tables using the model's formula:
+    compute_trig(d_head=16, n_ctx=max_pos, C=ROPE_C)."""
+    # Use the model's exact formula from src/nn/pe.py compute_trig
+    thetas = torch.exp(-math.log(ROPE_C) * torch.arange(0, D_HEAD, 2).float() / D_HEAD)
+    thetas = thetas.repeat([2, 1]).T.flatten()  # interleave: [t0,t0,t1,t1,...]
+    positions = torch.arange(max_pos).float()
+    all_thetas = positions.unsqueeze(1) * thetas.unsqueeze(0)
+    sins = torch.sin(all_thetas)
+    coss = torch.cos(all_thetas)
+    for i in range(N_BLOCKS):
+        p = f"blocks.{i}"
+        old_s = state[f"{p}.selfattn.rope.sins"]
+        if old_s.shape[1] >= max_pos:
+            continue
+        n_heads = old_s.shape[2]
+        new_sins = sins.unsqueeze(0).unsqueeze(2).expand(-1, -1, n_heads, -1).contiguous().to(torch.bfloat16)
+        new_coss = coss.unsqueeze(0).unsqueeze(2).expand(-1, -1, n_heads, -1).contiguous().to(torch.bfloat16)
+        old_max = old_s.shape[1]
+        max_err = (new_sins[:, :old_max] - old_s).abs().max().item()
+        if max_err > 0.1:
+            raise ValueError(f"RoPE table mismatch for block {i}: max_err={max_err:.4f}")
+        state[f"{p}.selfattn.rope.sins"] = new_sins
+        state[f"{p}.selfattn.rope.coss"] = new_coss
+    print(f"Extended RoPE tables to {max_pos} positions")
+
+
 def build_rope_tables(state, offset, tt_device):
     """Build sin/cos tables in head-batched 2D format for device-side RoPE.
     Returns dict of device tensors: {block_idx: (sin_tt, cos_tt)}.
@@ -1067,7 +1096,7 @@ def prealloc_scratch(tt_device):
 # ============================================================
 
 def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-                mean_scale_16_tt, rope_tables, kv_cache=None, frame_idx=0):
+                mean_scale_16_tt, rope_tables, device_kv_cache=None, frame_idx=0):
     """Forward pass. Patch/unpatch per step (nonlinear), conditioning + final_mod on device."""
     timers = {}
     def tnow(): return time.time()
@@ -1090,7 +1119,8 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
     z_next = scr['z_b']
     timers['patch'] = tnow() - t0
 
-    new_kv = []
+    new_device_kv = []
+    first_frame = device_kv_cache is None
     attn_sub = None
 
     block_timers = {k: 0.0 for k in [
@@ -1141,7 +1171,7 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         fused_k_norm_rope(scr['qkv_out'], dev[f'{p}.lnk_w'],
                           rope_tables[block_idx][0], rope_tables[block_idx][1],
                           dev['rope_perm'], scaler_tt, mean_scale_16_tt, scr['hb_b'])
-        k_new_sdpa = ttnn.reshape(scr['hb_b'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
+        k_new = ttnn.reshape(scr['hb_b'], [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         t_k = tnow() - t1
 
         t1 = tnow()
@@ -1150,49 +1180,28 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
                             [SEQ_PADDED, 3 * N_HEADS * D_HEAD_PAD])
         v_3d = ttnn.reshape(v_flat, [SEQ_PADDED, N_HEADS, D_HEAD_PAD])
         v_hm = ttnn.permute(v_3d, [1, 0, 2])
-        v_sdpa = ttnn.reshape(v_hm, [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
+        v_new = ttnn.reshape(v_hm, [1, N_HEADS, SEQ_PADDED, D_HEAD_PAD])
         t_v = tnow() - t1
 
-        # Extract raw K/V to host (pre-norm, pre-RoPE) for cache
+        # Device-side KV cache: concat new K/V with cached K/V on device
         t1 = tnow()
-        qkv_h = ttnn.to_torch(scr['qkv_out'])[:SEQ]
-        k_start = N_HEADS * D_HEAD_PAD
-        k_raw = qkv_h[:, k_start:k_start + N_HEADS * D_HEAD_PAD]
-        k_raw = k_raw.reshape(1, SEQ, N_HEADS, D_HEAD_PAD)[:, :, :, :D_HEAD]
-        v_start = 2 * N_HEADS * D_HEAD_PAD
-        v_raw = qkv_h[:, v_start:v_start + N_HEADS * D_HEAD_PAD]
-        v_raw = v_raw.reshape(1, SEQ, N_HEADS, D_HEAD_PAD)[:, :, :, :D_HEAD]
-        new_kv.append({'k': k_raw, 'v': v_raw})
-
-        # Rebuild full K/V with correct RoPE positions for SDPA
-        if kv_cache is not None and kv_cache[block_idx] is not None:
-            k_all = torch.cat([kv_cache[block_idx]['k'], k_raw], dim=1)
-            v_all = torch.cat([kv_cache[block_idx]['v'], v_raw], dim=1)
+        if not first_frame:
+            k_full = ttnn.concat([device_kv_cache[block_idx]['k'], k_new], dim=2)
+            v_full = ttnn.concat([device_kv_cache[block_idx]['v'], v_new], dim=2)
+            new_device_kv.append({'k': k_full, 'v': v_full})
         else:
-            k_all = k_raw
-            v_all = v_raw
-        total_kv = k_all.shape[1]
-        kv_padded = ((total_kv + TILE - 1) // TILE) * TILE
-
-        # Apply RMSNorm + RoPE to all K with correct positions
-        k_normed = rmsnorm_host(k_all, state[f"{p}.selfattn.lnk.w"])
-        sins = state[f"{p}.selfattn.rope.sins"][:, :total_kv, :, :]
-        coss = state[f"{p}.selfattn.rope.coss"][:, :total_kv, :, :]
-        k_roped = apply_rope(k_normed, sins, coss)
-
-        k_sdpa_h = F.pad(F.pad(k_roped.permute(0, 2, 1, 3),
-                                (0, D_HEAD_PAD - D_HEAD)),
-                          (0, 0, 0, kv_padded - total_kv))
-        v_sdpa_h = F.pad(F.pad(v_all.permute(0, 2, 1, 3),
-                                (0, D_HEAD_PAD - D_HEAD)),
-                          (0, 0, 0, kv_padded - total_kv))
-        k_sdpa = to_tt(k_sdpa_h, tt_device)
-        v_full = to_tt(v_sdpa_h, tt_device)
+            k_full = k_new
+            v_full = v_new
+            # Scratch buffers get reused across blocks; save to host for persistence
+            new_device_kv.append({
+                'k_host': ttnn.to_torch(k_new),
+                'v_host': ttnn.to_torch(v_new),
+            })
         t_kv_cache = tnow() - t1
 
         t1 = tnow()
         attn_out_tt = ttnn.transformer.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_full, is_causal=False, scale=1.0)
+            q_sdpa, k_full, v_full, is_causal=False, scale=1.0)
         t_sdpa = tnow() - t1
 
         t1 = tnow()
@@ -1255,6 +1264,13 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
     out = unpatch_forward(z_no_reg, state)
     timers['unpatch'] = tnow() - t0
 
+    # First frame: convert host tensors back to device for cache persistence
+    if first_frame:
+        new_device_kv = [
+            {'k': to_tt(e['k_host'], tt_device), 'v': to_tt(e['v_host'], tt_device)}
+            for e in new_device_kv
+        ]
+
     total = sum(timers.values()) + sum(block_timers.values())
     print(f"  dit_forward total: {total*1000:.0f}ms")
     print(f"    conditioning: {timers['conditioning']*1000:.1f}ms")
@@ -1270,19 +1286,16 @@ def dit_forward(z_frame, time_pe_tt, action_tt, state, dev, scr, tt_device, scal
         for k, v in attn_sub.items():
             print(f"      {k:20s}: {v*1000:6.2f}ms")
 
-    return out, new_kv
+    return out, new_device_kv
 
 
 def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-                 mean_scale_16_tt, kv_cache=None, frame_idx=0):
+                 mean_scale_16_tt, device_kv_cache=None, frame_idx=0):
     ts = 1 - torch.linspace(0, 1, n_steps + 1)
     ts = 3 * ts / (2 * ts + 1)
 
-    # Build RoPE sin/cos tables for Q (constant across denoise steps)
-    # K gets RoPE applied host-side in dit_forward with correct positions
-    kv_offset = 0
-    if kv_cache is not None and kv_cache[0] is not None:
-        kv_offset = kv_cache[0]['k'].shape[1]
+    # RoPE offset = absolute position of this frame's first token
+    kv_offset = frame_idx * TOKS_PER_FRAME
     rope_tables = build_rope_tables(state, kv_offset, tt_device)
 
     # Pre-cache per-frame constants on device (avoid to_tt in hot loop)
@@ -1307,53 +1320,48 @@ def sample_frame(z_noise, action_idx, n_steps, cfg, state, dev, scr, tt_device, 
     # do Euler steps in token space on device, and unpatch once at the end.
     # That would save ~3ms/step in patch+unpatch host overhead.
     z = z_noise.clone()
-    new_kv = None
+    new_device_kv = None
     for i in range(n_steps):
         t_val = ts[i].item()
         dt = (ts[i] - ts[i+1]).item()
 
-        v_cond, new_kv = dit_forward(
+        v_cond, new_device_kv = dit_forward(
             z, time_pe_tts[i], action_tt, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-            mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
+            mean_scale_16_tt, rope_tables, device_kv_cache=device_kv_cache, frame_idx=frame_idx)
 
         if cfg > 0 and cfg != 1.0:
             v_uncond, _ = dit_forward(
                 z, time_pe_tts[i], to_tt(torch.zeros(TILE, D_MODEL, dtype=torch.bfloat16), tt_device),
                 state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-                mean_scale_16_tt, rope_tables, kv_cache=kv_cache, frame_idx=frame_idx)
+                mean_scale_16_tt, rope_tables, device_kv_cache=device_kv_cache, frame_idx=frame_idx)
             v_pred = v_uncond.float() + cfg * (v_cond.float() - v_uncond.float())
         else:
             v_pred = v_cond.float()
 
         z = (z.float() + dt * v_pred).to(torch.bfloat16)
 
-    return z.clamp(-1, 1), new_kv
+    return z.clamp(-1, 1), new_device_kv
 
 
-def extend_kv_cache(kv_cache, new_kv, n_window):
-    """Extend KV cache with raw host K/V. Concat along seq dim (dim=1)."""
-    max_cached_frames = n_window - 1
-    max_cached_seq = max_cached_frames * TOKS_PER_FRAME
-
-    if kv_cache is None:
-        return new_kv
-
+def trim_kv_cache(device_kv_cache, n_window):
+    """Trim device KV cache to at most n_window-1 frames.
+    device_kv_cache entries have K/V as ttnn tensors in SDPA format:
+    (1, N_HEADS, seq, D_HEAD_PAD) where seq = n_frames * SEQ_PADDED.
+    dit_forward already concats new K/V, so this just trims the oldest frames."""
+    if device_kv_cache is None:
+        return None
+    max_seq = (n_window - 1) * SEQ_PADDED
     updated = []
-    for layer_idx in range(N_BLOCKS):
-        old_k = kv_cache[layer_idx]['k']
-        old_v = kv_cache[layer_idx]['v']
-        cur_k = new_kv[layer_idx]['k']
-        cur_v = new_kv[layer_idx]['v']
-
-        full_k = torch.cat([old_k, cur_k], dim=1)
-        full_v = torch.cat([old_v, cur_v], dim=1)
-
-        if full_k.shape[1] > max_cached_seq:
-            full_k = full_k[:, -max_cached_seq:]
-            full_v = full_v[:, -max_cached_seq:]
-
-        updated.append({'k': full_k, 'v': full_v})
-
+    for layer in device_kv_cache:
+        k, v = layer['k'], layer['v']
+        seq_len = k.shape[2]
+        if seq_len > max_seq:
+            excess = seq_len - max_seq
+            k = ttnn.slice(k, [0, 0, excess, 0],
+                           [k.shape[0], k.shape[1], seq_len, k.shape[3]])
+            v = ttnn.slice(v, [0, 0, excess, 0],
+                           [v.shape[0], v.shape[1], seq_len, v.shape[3]])
+        updated.append({'k': k, 'v': v})
     return updated
 
 
@@ -1376,6 +1384,7 @@ if __name__ == "__main__":
     # Pre-load all weights and scratch buffers to device
     dev = preload_weights(state, tt_device)
     scr = prealloc_scratch(tt_device)
+    extend_rope_tables(state)
 
     N_STEPS = 8
     CFG = 1.0
@@ -1384,22 +1393,22 @@ if __name__ == "__main__":
     actions = [2] * N_FRAMES_GEN
 
     frames = []
-    kv_cache = None
+    device_kv_cache = None
     t_total = time.time()
 
     for fidx in range(N_FRAMES_GEN):
         action = actions[fidx]
-        cached_frames = 0 if kv_cache is None else kv_cache[0]['k'].shape[2] // TOKS_PER_FRAME
+        cached_frames = 0 if device_kv_cache is None else device_kv_cache[0]['k'].shape[2] // SEQ_PADDED
         print(f"Frame {fidx+1}/{N_FRAMES_GEN} (action={action}, cached={cached_frames} frames)...")
 
         noise = torch.randn(1, 3, HEIGHT, WIDTH, dtype=torch.bfloat16)
         t0 = time.time()
 
-        frame, new_kv = sample_frame(
+        frame, new_device_kv = sample_frame(
             noise, action, N_STEPS, CFG, state, dev, scr, tt_device, scaler_tt, mean_scale_tt,
-            mean_scale_16_tt, kv_cache=kv_cache, frame_idx=fidx)
+            mean_scale_16_tt, device_kv_cache=device_kv_cache, frame_idx=fidx)
 
-        kv_cache = extend_kv_cache(kv_cache, new_kv, N_WINDOW)
+        device_kv_cache = trim_kv_cache(new_device_kv, N_WINDOW)
 
         elapsed = time.time() - t0
         print(f"  FRAME DONE in {elapsed:.1f}s, range=[{frame.min().item():.2f}, {frame.max().item():.2f}]")

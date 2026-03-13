@@ -24,9 +24,9 @@ import http.server
 import threading
 
 from sample_v2 import (
-    sample_frame, extend_kv_cache, preload_weights, prealloc_scratch,
-    to_tt, zeros_tt,
-    D_MODEL, D_HEAD, TILE, N_BLOCKS, TOKS_PER_FRAME, HEIGHT, WIDTH,
+    sample_frame, trim_kv_cache, preload_weights, prealloc_scratch,
+    extend_rope_tables, to_tt, zeros_tt,
+    D_MODEL, D_HEAD, TILE, N_BLOCKS, TOKS_PER_FRAME, SEQ_PADDED, HEIGHT, WIDTH,
 )
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -135,7 +135,7 @@ class GameState:
         self.scaler_tt = None
         self.mean_scale_tt = None
         self.mean_scale_16_tt = None
-        self.kv_cache = None
+        self.device_kv_cache = None
         self.frame_idx = 0
         self.n_steps = 6
         self.cfg = 1.0
@@ -158,6 +158,8 @@ class GameState:
         self.dev = preload_weights(self.state, self.tt_device)
         print("Pre-allocating scratch buffers...")
         self.scr = prealloc_scratch(self.tt_device)
+        print("Extending RoPE tables...")
+        extend_rope_tables(self.state)
         print("Model ready!")
 
     def generate_frame(self, action, n_steps=None):
@@ -165,13 +167,13 @@ class GameState:
             steps = n_steps if n_steps is not None else self.n_steps
             noise = torch.randn(1, 3, HEIGHT, WIDTH, dtype=torch.bfloat16)
             t0 = time.time()
-            frame, new_kv = sample_frame(
+            frame, new_device_kv = sample_frame(
                 noise, action, steps, self.cfg,
                 self.state, self.dev, self.scr, self.tt_device,
                 self.scaler_tt, self.mean_scale_tt, self.mean_scale_16_tt,
-                kv_cache=self.kv_cache, frame_idx=self.frame_idx,
+                device_kv_cache=self.device_kv_cache, frame_idx=self.frame_idx,
             )
-            self.kv_cache = extend_kv_cache(self.kv_cache, new_kv, self.n_window)
+            self.device_kv_cache = trim_kv_cache(new_device_kv, self.n_window)
             elapsed = time.time() - t0
             cached_frames = min(self.frame_idx, self.n_window - 1)
             fidx = self.frame_idx
