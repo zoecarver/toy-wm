@@ -30,6 +30,10 @@ If the server is running inside Docker or on a remote machine, set up port forwa
 ssh -L 8765:localhost:8765 user@server
 ```
 
+## Autonomous optimization
+
+The TT-Lang kernels in this project were optimized through fully autonomous iterative profiling and kernel fusion by Claude ("autoresearch" style). Starting from a **34ms/step** baseline with 144+ kernel launches, Claude autonomously identified bottlenecks, wrote and tested fused TT-Lang kernels, reverted failed experiments, and iterated to reach **~21ms/step** -- a ~40% wall-time reduction. Key wins included fixing device-side modulation broadcast (eliminating host round-trips), fusing norm+modulate and linear+gated_residual into single kernels, batching modulation across all 8 DiT blocks, and merging QKV projection with norm+RoPE into a single kernel launch. See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md) for the full history of what worked, what failed, and why.
+
 ## Implementation
 
 The model is an mmDiT-style frame-autoregressive diffusion transformer with 8 blocks, sampled via rectified flow matching. Each frame goes through multiple Euler denoising steps, where each step runs the full DiT forward pass (~35ms per step on a single Blackhole card). KV caching across frames means attention sees the full context window without recomputation.
@@ -103,10 +107,6 @@ All kernels use `grid="auto"` for automatic multi-core distribution and stream t
 - `play.py` -- HTTP server that generates frames on TT hardware in response to player actions
 - `model.pt` -- pretrained weights
 - `ttlang/kernels/` -- standalone TT-Lang kernel implementations used during development
-
-## Autonomous optimization
-
-The TT-Lang kernels in this project were optimized through fully autonomous iterative profiling and kernel fusion by Claude ("autoresearch" style). Starting from a **34ms/step** baseline with 144+ kernel launches, Claude autonomously identified bottlenecks, wrote and tested fused TT-Lang kernels, reverted failed experiments, and iterated to reach **~21ms/step** -- a ~40% wall-time reduction. Key wins included fixing device-side modulation broadcast (eliminating host round-trips), fusing norm+modulate and linear+gated_residual into single kernels, batching modulation across all 8 DiT blocks, and merging QKV projection with norm+RoPE into a single kernel launch. See [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md) for the full history of what worked, what failed, and why.
 
 ## Dependencies
 
